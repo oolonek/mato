@@ -1,0 +1,29 @@
+# Extracted Zenodo ENPKG toy dataset: six raw mzXML spectra, three sample rows.
+# All outputs below live outside the downloaded sapayoa dataset and the existing
+# production flock SQLite database.
+flock_root = "../.."
+
+[pipeline]
+stages = ["validate", "ingest", "enrich", "picoto", "register", "annotate"]
+
+[dataset]
+root = "/media/nvme8tb/isla-gabriela/sapayoa/zenodo-10018590"
+doi = "10.5281/zenodo.10018264"
+metadata = "metadata/metadata.tsv"
+ms_dir = "msdata/raw"
+taxon_column = "source_taxon"
+
+[database]
+path = "/media/nvme8tb/isla-gabriela/mato/toy.sqlite"
+
+[cunaguaro]
+jobs = 2
+
+[picoto]
+output_dir = "/media/nvme8tb/isla-gabriela/mato/toy-picoto"
+jobs = 2
+
+[annotation]
+library = "/media/nvme8tb/isla-gabriela/hocofaisan/references/isdb_lotus_pos_energySum.mgf"
+lotus_csv = "/media/nvme8tb/isla-gabriela/hocofaisan/references/230106_frozen_metadata.csv"
+settings = "../../hocofaisan/config/example.toml"
