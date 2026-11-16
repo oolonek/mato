@@ -1,29 +1,25 @@
-# Extracted Zenodo ENPKG toy dataset: six raw mzXML spectra, three sample rows.
-# All outputs below live outside the downloaded sapayoa dataset and the existing
-# production flock SQLite database.
+# Portable example: copy to toy.local.toml, set real paths, and keep that file ignored.
+# The job database, Picoto outputs, and reference files must be outside the source dataset.
 flock_root = "../.."
 
 [pipeline]
-stages = ["validate", "ingest", "enrich", "picoto", "register", "annotate"]
+stages = ["validate", "ingest", "enrich", "picoto", "register", "annotate", "chemical_enrich"]
 
 [dataset]
-root = "/media/nvme8tb/isla-gabriela/sapayoa/zenodo-10018590"
+root = "/path/to/extracted/zenodo-10018590"
 doi = "10.5281/zenodo.10018264"
 metadata = "metadata/metadata.tsv"
 ms_dir = "msdata/raw"
 taxon_column = "source_taxon"
 
 [database]
-path = "/media/nvme8tb/isla-gabriela/mato/toy.sqlite"
-
-[cunaguaro]
-jobs = 2
+path = "/path/to/job/toy.sqlite"
 
 [picoto]
-output_dir = "/media/nvme8tb/isla-gabriela/mato/toy-picoto"
+output_dir = "/path/to/job/toy-picoto"
 jobs = 2
 
 [annotation]
-library = "/media/nvme8tb/isla-gabriela/hocofaisan/references/isdb_lotus_pos_energySum.mgf"
-lotus_csv = "/media/nvme8tb/isla-gabriela/hocofaisan/references/230106_frozen_metadata.csv"
+library = "/path/to/references/isdb_lotus_pos_energySum.mgf"
+lotus_csv = "/path/to/references/230106_frozen_metadata.csv"
 settings = "../../hocofaisan/config/example.toml"

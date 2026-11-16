@@ -1,4 +1,6 @@
 mod config;
+mod job;
+mod report;
 
 use std::collections::{BTreeSet, HashMap};
 use std::env;
@@ -10,12 +12,12 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 use anyhow::{Context, Result, bail, ensure};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 use walkdir::WalkDir;
 use rusqlite::{Connection, OpenFlags, params};
 
-use crate::config::{Config, Stage};
+use crate::config::{Config, SharedIndexes, Stage};
 
 #[derive(Parser)]
 #[command(about = "Run the configured flock pipeline using the existing species CLIs")]
@@ -30,20 +32,76 @@ enum Action {
     Run {
         #[arg(long)]
         config: PathBuf,
-        /// Process at most N metadata rows and their spectra from the original dataset.
-        /// Requires an isolated database for the selected rows.
-        #[arg(long)]
-        max_rows: Option<usize>,
+        /// Run the first N metadata rows in an isolated top-N job configured in this TOML.
+        #[arg(long = "topN")]
+        top_n: Option<usize>,
         /// Stream registration filenames and Cunaguaro per-name results.
         #[arg(long)]
         verbose: bool,
     },
+    /// Refresh the shared Wikidata indexes configured once for all jobs.
+    Indexes {
+        #[command(subcommand)]
+        action: IndexAction,
+    },
+    /// Inspect the configured job paths and database without creating it.
+    Inspect {
+        #[arg(long)]
+        config: PathBuf,
+        /// Inspect the isolated job for the first N metadata rows.
+        #[arg(long = "topN")]
+        top_n: Option<usize>,
+    },
+    /// Delete this job's database and Picoto outputs permanently.
+    Reset {
+        #[arg(long)]
+        config: PathBuf,
+        /// Reset only the isolated job for the first N metadata rows.
+        #[arg(long = "topN")]
+        top_n: Option<usize>,
+        /// Confirm deletion of the configured database and Picoto output directory.
+        #[arg(long, required = true)]
+        yes: bool,
+    },
+    /// Preview a table or view from the configured job database.
+    Show {
+        table: String,
+        #[arg(long)]
+        config: PathBuf,
+        /// Preview the isolated job for the first N metadata rows.
+        #[arg(long = "topN")]
+        top_n: Option<usize>,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
 }
 
-fn status(mut command: Command, description: &str) -> Result<()> {
-    let outcome = command
+#[derive(Subcommand)]
+enum IndexAction {
+    /// Download both QLever snapshots, or only one of them.
+    Refresh {
+        /// Alternate shared-index TOML; defaults to mato/config/wikidata.toml.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        only: Option<IndexKind>,
+    },
+}
+
+#[derive(Clone, Copy, Eq, PartialEq, ValueEnum)]
+enum IndexKind {
+    Taxon,
+    Chemical,
+}
+
+fn child_outcome(mut command: Command, description: &str) -> Result<std::process::ExitStatus> {
+    command
         .status()
-        .with_context(|| format!("starting {description}"))?;
+        .with_context(|| format!("starting {description}"))
+}
+
+fn status(command: Command, description: &str) -> Result<()> {
+    let outcome = child_outcome(command, description)?;
     ensure!(
         outcome.success(),
         "{description} failed ({outcome}); stopping pipeline"
@@ -51,8 +109,8 @@ fn status(mut command: Command, description: &str) -> Result<()> {
     Ok(())
 }
 
-fn binary(config: &Config, species: &'static str) -> Result<PathBuf> {
-    let repo = config.flock_root.join(species);
+fn binary(flock_root: &Path, species: &'static str) -> Result<PathBuf> {
+    let repo = flock_root.join(species);
     let manifest = repo.join("Cargo.toml");
     let target = match env::var_os("CARGO_TARGET_DIR") {
         Some(path) if Path::new(&path).is_absolute() => PathBuf::from(path),
@@ -61,7 +119,7 @@ fn binary(config: &Config, species: &'static str) -> Result<PathBuf> {
     };
     let mut build = Command::new(env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo")));
     build
-        .current_dir(&config.flock_root)
+        .current_dir(flock_root)
         .arg("build")
         .arg("--release")
         .arg("--manifest-path")
@@ -82,8 +140,31 @@ fn binary(config: &Config, species: &'static str) -> Result<PathBuf> {
     Ok(binary)
 }
 
+fn refresh_indexes(config: Option<PathBuf>, only: Option<IndexKind>) -> Result<()> {
+    let config = config.unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("config/wikidata.toml"));
+    let indexes = SharedIndexes::load(&config)?;
+    let flock_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent().context("Mato source tree has no parent")?;
+    let executable = binary(flock_root, "cunaguaro")?;
+    for (kind, command, path, endpoint) in [
+        (IndexKind::Taxon, "taxon-index", &indexes.taxon_index, indexes.taxon_endpoint.as_deref()),
+        (IndexKind::Chemical, "chemical-index", &indexes.chemical_index, indexes.chemical_endpoint.as_deref()),
+    ] {
+        if only.is_some_and(|selected| selected != kind) {
+            continue;
+        }
+        let mut child = Command::new(&executable);
+        child.arg(command).arg("--index").arg(path);
+        if let Some(endpoint) = endpoint {
+            child.arg("--endpoint").arg(endpoint);
+        }
+        status(child, &format!("refreshing shared {command} at {}", path.display()))?;
+    }
+    Ok(())
+}
+
 fn limited_db(config: &Config, max_rows: usize) -> Result<Option<Connection>> {
-    ensure!(max_rows > 0, "--max-rows must be positive");
+    ensure!(max_rows > 0, "--topN must be positive");
     if !config.db.exists() {
         return Ok(None);
     }
@@ -100,19 +181,19 @@ fn limited_db(config: &Config, max_rows: usize) -> Result<Option<Connection>> {
                 root == config.dataset_root.to_str().unwrap_or("")
                     && metadata == config.metadata.to_str().unwrap_or("")
             }),
-        "--max-rows requires an isolated database for this dataset and metadata"
+        "--topN requires an isolated database for this dataset and metadata"
     );
     let rows: i64 = db.query_row("SELECT COUNT(*) FROM sample_rows", [], |row| row.get(0))?;
     ensure!(
-        rows <= i64::try_from(max_rows).context("--max-rows exceeds SQLite row range")?,
-        "existing database has {rows} sample rows; use a separate database for --max-rows {max_rows}"
+        rows <= i64::try_from(max_rows).context("--topN exceeds SQLite row range")?,
+        "existing top-N database has {rows} sample rows; reset only this top-N job before changing its dataset"
     );
     Ok(Some(db))
 }
 
 fn limited_files(config: &Config, max_rows: usize) -> Result<Vec<PathBuf>> {
     let db = limited_db(config, max_rows)?
-        .context("--max-rows needs an ingested database; run the ingest stage first")?;
+        .context("--topN needs an ingested database; run the ingest stage first")?;
     let mut query = db.prepare(
         "SELECT s.relative_path FROM spectrum_files s JOIN datasets d ON d.id=s.dataset_id \
          WHERE d.root=?1 AND d.metadata_path=?2 ORDER BY s.row_number, s.filename",
@@ -357,12 +438,26 @@ fn register(config: &Config, binary: &Path, files: &[PathBuf], verbose: bool) ->
     })
 }
 
-fn run(config: Config, verbose: bool, max_rows: Option<usize>) -> Result<()> {
+#[derive(Clone, Copy)]
+enum RunStatus { Complete, Partial }
+
+fn run(config: &Config, verbose: bool, max_rows: Option<usize>) -> Result<RunStatus> {
     if let Some(max_rows) = max_rows {
-        ensure!(max_rows > 0, "--max-rows must be positive");
+        ensure!(max_rows > 0, "--topN must be positive");
+    }
+    if config.stages.contains(&Stage::Enrich) {
+        ensure!(config.taxon_index.is_file(),
+            "shared Wikidata taxon index missing: {} (run mato indexes refresh --only taxon)",
+            config.taxon_index.display());
+    }
+    if config.stages.contains(&Stage::ChemicalEnrich) {
+        ensure!(config.chemical_index.is_file(),
+            "shared Wikidata chemical index missing: {} (run mato indexes refresh --only chemical)",
+            config.chemical_index.display());
     }
     let mut built = HashMap::new();
     let mut raw = None;
+    let mut partial_annotation = false;
     eprintln!("🐦 flock: 🦎 mato starting {} stages", config.stages.len());
     for (index, stage) in config.stages.iter().enumerate() {
         eprintln!(
@@ -384,7 +479,7 @@ fn run(config: Config, verbose: bool, max_rows: Option<usize>) -> Result<()> {
         }
         let species = stage.species();
         if !built.contains_key(species) {
-            built.insert(species, binary(&config, species)?);
+            built.insert(species, binary(&config.flock_root, species)?);
         }
         let executable = built.get(species).context("built species missing")?;
         match stage {
@@ -432,8 +527,8 @@ fn run(config: Config, verbose: bool, max_rows: Option<usize>) -> Result<()> {
                         command
                             .arg("--db")
                             .arg(&config.db)
-                            .arg("--jobs")
-                            .arg(config.cunaguaro_jobs.to_string());
+                            .arg("--index")
+                            .arg(&config.taxon_index);
                         if verbose {
                             command.arg("--verbose");
                         }
@@ -469,7 +564,8 @@ fn run(config: Config, verbose: bool, max_rows: Option<usize>) -> Result<()> {
                             .arg(&config.settings);
                     }
                     Stage::ChemicalEnrich => {
-                        command.arg("enrich").arg("--db").arg(&config.db);
+                        command.arg("chemical-enrich").arg("--db").arg(&config.db)
+                            .arg("--index").arg(&config.chemical_index);
                         if verbose {
                             command.arg("--verbose");
                         }
@@ -479,21 +575,80 @@ fn run(config: Config, verbose: bool, max_rows: Option<usize>) -> Result<()> {
                 if let Some(manifest) = &selected {
                     command.arg("--files-from").arg(manifest.path());
                 }
-                status(
-                    command,
-                    &format!("{} {} {}", stage.emoji(), stage.species(), stage.name()),
-                )?;
+                let description = format!("{} {} {}", stage.emoji(), stage.species(), stage.name());
+                if *stage == Stage::Annotate {
+                    let outcome = child_outcome(command, &description)?;
+                    if outcome.code() == Some(2) {
+                        partial_annotation = true;
+                        eprintln!("🦎 mato: annotation files failed and were recorded; continuing to later stages for saved hits");
+                    } else {
+                        ensure!(outcome.success(), "{description} failed ({outcome}); stopping pipeline");
+                    }
+                } else {
+                    status(command, &description)?;
+                }
             }
         }
-        eprintln!("🦎 mato: {} {} complete", stage.emoji(), stage.species());
+        if *stage == Stage::Annotate && partial_annotation {
+            eprintln!("🦎 mato: {} {} partial; failed files will be retried on the next annotate run", stage.emoji(), stage.species());
+        } else {
+            eprintln!("🦎 mato: {} {} complete", stage.emoji(), stage.species());
+        }
     }
-    eprintln!("🐦 flock: 🦎 mato pipeline complete");
-    Ok(())
+    Ok(if partial_annotation { RunStatus::Partial } else { RunStatus::Complete })
+}
+
+fn run_reported(path: &Path, verbose: bool, top_n: Option<usize>) -> Result<()> {
+    let config = Config::load(path, top_n)?;
+    let started = report::start(&config);
+    let outcome = run(&config, verbose, top_n);
+    let status = match &outcome {
+        Ok(RunStatus::Complete) => "complete",
+        Ok(RunStatus::Partial) => "partial",
+        Err(_) => "failed",
+    };
+    let saved = report::write(&config, top_n, &started, status, outcome.as_ref().err());
+    match &saved {
+        Ok(path) => eprintln!("🐦 flock: 🦎 mato report: {}", path.display()),
+        Err(error) => eprintln!("🐦 flock: 🦎 mato could not write run report: {error:#}"),
+    }
+    let pipeline = match outcome {
+        Ok(RunStatus::Complete) => Ok(()),
+        Ok(RunStatus::Partial) => Err(anyhow::anyhow!("annotation files require reprocessing; later stages ran on saved hits (inspect annotation_runs.error)")),
+        Err(error) => Err(error),
+    };
+    match (pipeline, saved) {
+        (Ok(()), Ok(_)) => {
+            eprintln!("🐦 flock: 🦎 mato pipeline complete");
+            Ok(())
+        },
+        (Err(error), Ok(_)) => Err(error),
+        (Ok(()), Err(error)) => Err(error).context("writing Mato run report"),
+        (Err(error), Err(report_error)) => Err(error.context(format!("also failed to write Mato run report: {report_error:#}"))),
+    }
 }
 
 fn main() -> Result<()> {
     match Cli::parse().command {
-        Action::Run { config, verbose, max_rows } => run(Config::load(&config)?, verbose, max_rows),
+        Action::Run { config, verbose, top_n } => run_reported(&config, verbose, top_n),
+        Action::Indexes { action: IndexAction::Refresh { config, only } } =>
+            refresh_indexes(config, only),
+        Action::Inspect { config, top_n } => job::inspect(&Config::load(&config, top_n)?),
+        Action::Reset { config, top_n, yes: _ } => job::reset(&Config::load(&config, top_n)?),
+        Action::Show { config, top_n, table, limit } => {
+            let config = Config::load(&config, top_n)?;
+            job::require_db(&config)?;
+            let peregrino = binary(&config.flock_root, "peregrino")?;
+            let mut command = Command::new(peregrino);
+            command
+                .arg("show")
+                .arg(table)
+                .arg("--db")
+                .arg(&config.db)
+                .arg("--limit")
+                .arg(limit.to_string());
+            status(command, "showing database table")
+        }
     }
 }
 
@@ -548,6 +703,7 @@ exit 1
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
         let config = Config {
             path: root.join("unused.toml"),
+            top_n: None,
             flock_root: root.to_path_buf(),
             stages: vec![Stage::Register],
             dataset_root: root.to_path_buf(),
@@ -557,11 +713,13 @@ exit 1
             db: root.join("unused.sqlite"),
             output_dir,
             picoto_jobs: 1,
-            cunaguaro_jobs: 1,
+            taxon_index: PathBuf::new(),
             peregrino_jobs: 2,
             library: PathBuf::new(),
             lotus_csv: PathBuf::new(),
             settings: PathBuf::new(),
+            chemical_index: PathBuf::new(),
+            indexes_config: PathBuf::new(),
         };
         register(&config, &binary, &files, false).unwrap();
     }

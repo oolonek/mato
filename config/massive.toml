@@ -1,35 +1,33 @@
-# Run from any working directory: mato resolves relative paths beside this file.
+# Portable example: copy to massive.local.toml and set real paths before inspecting.
 flock_root = "../.."
 
 [pipeline]
-# Ordered stages; remove completed stages before resuming. Keep ingest selected
-# when changing taxon_column so stored taxa reflect the new explicit mapping.
-# stages = ["validate", "ingest", "enrich", "picoto", "register", "annotate"]
+# Ordered production stages; remove completed stages before resuming. Keep ingest
+# selected when changing taxon_column so stored taxa reflect the new mapping.
 stages = ["annotate"]
+top_n_stages = ["validate", "ingest", "enrich", "picoto", "register", "annotate", "chemical_enrich"]
 
 
 [dataset]
-root = "/media/nvme8tb/isla-gabriela/sapayoa/MSV000102993"
+root = "/path/to/extracted/MSV000102993"
 doi = "10.25345/C55T3GD90"
 metadata = "metadata/metadata/dbgi_massive_metadata_20260806.tsv"
 ms_dir = "peak/peak"
 taxon_column = "taxon_scientific_name"
 
 [database]
-path = "/media/nvme8tb/isla-gabriela/peregrino/flock.sqlite"
-
-[cunaguaro]
-jobs = 2
+path = "/path/to/production/flock.sqlite"
+top_n_root = "/path/to/isolated/top-n"
 
 [peregrino]
 # Concurrent per-file Picoto registrations; ingestion remains transactional.
 jobs = 4
 
 [picoto]
-output_dir = "/media/nvme8tb/isla-gabriela/picoto/massive"
+output_dir = "/path/to/production/picoto"
 jobs = 25
 
 [annotation]
-library = "/media/nvme8tb/isla-gabriela/hocofaisan/references/isdb_lotus_pos_energySum.mgf"
-lotus_csv = "/media/nvme8tb/isla-gabriela/hocofaisan/references/230106_frozen_metadata.csv"
+library = "/path/to/references/isdb_lotus_pos_energySum.mgf"
+lotus_csv = "/path/to/references/230106_frozen_metadata.csv"
 settings = "../../hocofaisan/config/example.toml"

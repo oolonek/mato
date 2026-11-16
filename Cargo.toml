@@ -12,3 +12,6 @@ serde = { version = "1", features = ["derive"] }
 tempfile = "3"
 toml = "0.9"
 walkdir = "2"
+
+[dev-dependencies]
+sha2 = "0.10"
