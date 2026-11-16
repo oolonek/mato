@@ -20,4 +20,6 @@ New to the project? Start with the [plain-language flock overview](https://githu
 
 The [technical guide](TECHNICAL.md) covers jobs, results, resuming and configuration. The [flock roadmap](https://github.com/oolonek/flock-roadmap/blob/main/ROADMAP.md#flock-at-a-glance) shows the other species and their handoffs.
 
+The code is available under either the [MIT license](LICENSE-MIT) or the [Apache 2.0 license](LICENSE-APACHE).
+
 *Naming note: For new species names, we take inspiration from [colonizer](https://crates.io/crates/colonizer)'s `inspire` mode, which suggests names from the Catalogue of Life, rather than inventing each crate name ourselves.*
