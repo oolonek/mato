@@ -1,6 +1,6 @@
 # mato
 
-Mato coordinates the [Isla Gabriola flock](https://github.com/oolonek/isla-gabriola-flock/blob/main/README.md), a group of tools that connects research samples, mass-spectrometry measurements, and possible chemical matches into a traceable record that can become a searchable knowledge graph. Its `bootstrap` command downloads and verifies the toy data and reference files, runs the complete pipeline, and exports and validates a KG; a possible match does not identify a chemical.
+Mato coordinates the [Isla Gabriola flock](https://github.com/oolonek/isla-gabriola-flock/blob/main/README.md), a group of tools that connects research samples, mass-spectrometry measurements, and possible chemical matches into a traceable record that can become a searchable knowledge graph. Its `bootstrap` command downloads and verifies the toy data and reference files, runs the complete pipeline, and exports and validates a KG.
 
 The name Mato refers to a lizard: the giant ameiva, *[Ameiva atrigularis](https://www.wikidata.org/wiki/Q2842576)* ([Catalogue of Life: 66B76](https://www.catalogueoflife.org/data/taxon/66B76)).
 
