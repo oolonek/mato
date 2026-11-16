@@ -7,7 +7,6 @@ use std::process::{Command, Output};
 struct Fixture {
     _temporary: tempfile::TempDir,
     config: PathBuf,
-    indexes_config: PathBuf,
     metadata: PathBuf,
     database: PathBuf,
 }
@@ -29,44 +28,42 @@ impl Fixture {
         fs::write(&metadata, "filename\tfile_path\tdirectus_filename\ttaxon_scientific_name\tionization_mode\nsample.mzML\tdbgi_msdata/sample.mzML\tsample\tGeranium sibiricum\tpositive\n").unwrap();
         let database = temporary.path().join("flock.sqlite");
         let config = temporary.path().join("pipeline.toml");
-        let indexes_config = temporary.path().join("wikidata.toml");
-        fs::write(&indexes_config,
-            "[indexes]\ntaxon_index = \"taxa.sqlite\"\nchemical_index = \"chemicals.sqlite\"\n"
-        ).unwrap();
         let flock_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
         fs::write(
             &config,
             format!(
-                r#"flock_root = "{}"
-wikidata_config = "wikidata.toml"
+                r#"workspace = "{}"
+flock_root = "{}"
 [pipeline]
 stages = {stages}
 [dataset]
-root = "{}"
+root = "dataset"
 doi = "10.25345/C55T3GD90"
 metadata = "metadata/samples.tsv"
 ms_dir = "peak/peak"
 taxon_column = "taxon_scientific_name"
 [database]
-path = "{}"
+path = "flock.sqlite"
 [picoto]
-output_dir = "{}"
+output_dir = "picoto"
 jobs = 1
 [annotation]
 library = "unused.mgf"
 lotus_csv = "unused.csv"
 settings = "unused.toml"
+[knowledge_graph]
+output_dir = "toy-kg"
+[indexes]
+taxon_index = "taxa.sqlite"
+chemical_index = "chemicals.sqlite"
 "#,
-                flock_root.display(),
-                root.display(),
-                database.display(),
-                temporary.path().join("picoto").display()
+                temporary.path().display(),
+                flock_root.display()
             ),
         )
         .unwrap();
         Self {
             _temporary: temporary,
-            indexes_config,
             config,
             metadata,
             database,
@@ -272,11 +269,11 @@ fn refresh_one_or_both_indexes_from_one_config_and_match_taxon() {
             stream.flush().unwrap();
         }
     });
-    let shared = fs::read_to_string(&fixture.indexes_config).unwrap();
-    fs::write(&fixture.indexes_config, format!("{shared}taxon_endpoint = \"{endpoint}\"\n")).unwrap();
+    let shared = fs::read_to_string(&fixture.config).unwrap();
+    fs::write(&fixture.config, format!("{shared}taxon_endpoint = \"{endpoint}\"\n")).unwrap();
     let refresh = Command::new(env!("CARGO_BIN_EXE_mato"))
         .args(["indexes", "refresh", "--only", "taxon", "--config"])
-        .arg(&fixture.indexes_config).output().unwrap();
+        .arg(&fixture.config).output().unwrap();
     assert!(refresh.status.success(), "{}", String::from_utf8_lossy(&refresh.stderr));
     assert!(fixture._temporary.path().join("taxa.sqlite").is_file());
     assert!(!fixture._temporary.path().join("chemicals.sqlite").exists());
@@ -297,12 +294,12 @@ fn refresh_one_or_both_indexes_from_one_config_and_match_taxon() {
             stream.flush().unwrap();
         }
     });
-    fs::write(&fixture.indexes_config,
+    fs::write(&fixture.config,
         format!("{shared}taxon_endpoint = \"{endpoint}\"\nchemical_endpoint = \"{chemical_endpoint}\"\n")
     ).unwrap();
     let both = Command::new(env!("CARGO_BIN_EXE_mato"))
         .args(["indexes", "refresh", "--config"])
-        .arg(&fixture.indexes_config).output().unwrap();
+        .arg(&fixture.config).output().unwrap();
     assert!(both.status.success(), "{}", String::from_utf8_lossy(&both.stderr));
     worker.join().unwrap();
     chemical_worker.join().unwrap();

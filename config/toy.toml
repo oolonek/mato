@@ -1,25 +1,32 @@
-# Portable example: copy to toy.local.toml, set real paths, and keep that file ignored.
-# The job database, Picoto outputs, and reference files must be outside the source dataset.
+# Set workspace to an existing writable directory outside this checkout. Mato creates subdirectories.
+workspace = "/path/to/workspace"
 flock_root = "../.."
 
 [pipeline]
 stages = ["validate", "ingest", "enrich", "picoto", "register", "annotate", "chemical_enrich"]
 
 [dataset]
-root = "/path/to/extracted/zenodo-10018590"
+root = "sapayoa/zenodo-10018590"
 doi = "10.5281/zenodo.10018264"
 metadata = "metadata/metadata.tsv"
 ms_dir = "msdata/raw"
 taxon_column = "source_taxon"
 
 [database]
-path = "/path/to/job/toy.sqlite"
+path = "mato/toy.sqlite"
 
 [picoto]
-output_dir = "/path/to/job/toy-picoto"
+output_dir = "mato/toy-picoto"
 jobs = 2
 
 [annotation]
-library = "/path/to/references/isdb_lotus_pos_energySum.mgf"
-lotus_csv = "/path/to/references/230106_frozen_metadata.csv"
+library = "hocofaisan/references/isdb_lotus_pos_energySum.mgf"
+lotus_csv = "hocofaisan/references/230106_frozen_metadata.csv"
 settings = "../../hocofaisan/config/example.toml"
+
+[indexes]
+taxon_index = "mato/wikidata/taxa.sqlite"
+chemical_index = "mato/wikidata/chemicals.sqlite"
+
+[knowledge_graph]
+output_dir = "mato/toy-kg"

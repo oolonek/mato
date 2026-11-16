@@ -1,4 +1,0 @@
-# Portable example: copy to wikidata.local.toml and choose shared index paths.
-[indexes]
-taxon_index = "/path/to/shared/wikidata/taxa.sqlite"
-chemical_index = "/path/to/shared/wikidata/chemicals.sqlite"

@@ -55,13 +55,10 @@ fn chemical_stage_uses_configured_shared_index_instead_of_reusing_stale_job_look
     drop(index);
 
     let config = root.join("job.toml");
-    fs::write(root.join("wikidata.toml"),
-        "[indexes]\ntaxon_index = \"taxa.sqlite\"\nchemical_index = \"shared.sqlite\"\n"
-    ).unwrap();
     let flock_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     fs::write(&config, format!(
-        "flock_root = {:?}\nwikidata_config = \"wikidata.toml\"\n[pipeline]\nstages = [\"chemical_enrich\"]\n[dataset]\nroot = {:?}\ndoi = \"doi\"\nmetadata = \"metadata.tsv\"\nms_dir = \"raw\"\ntaxon_column = \"taxon\"\n[database]\npath = {:?}\n[picoto]\noutput_dir = {:?}\njobs = 1\n[annotation]\nlibrary = \"unused.mgf\"\nlotus_csv = \"unused.csv\"\nsettings = \"unused.toml\"\n",
-        flock_root.display().to_string(), dataset.display().to_string(), db_path.display().to_string(), root.join("picoto").display().to_string()
+        "workspace = {:?}\nflock_root = {:?}\n[pipeline]\nstages = [\"chemical_enrich\"]\n[dataset]\nroot = \"dataset\"\ndoi = \"doi\"\nmetadata = \"metadata.tsv\"\nms_dir = \"raw\"\ntaxon_column = \"taxon\"\n[database]\npath = \"job.sqlite\"\n[picoto]\noutput_dir = \"picoto\"\njobs = 1\n[annotation]\nlibrary = \"unused.mgf\"\nlotus_csv = \"unused.csv\"\nsettings = \"unused.toml\"\n[indexes]\ntaxon_index = \"taxa.sqlite\"\nchemical_index = \"shared.sqlite\"\n[knowledge_graph]\noutput_dir = \"toy-kg\"\n",
+        root.display().to_string(), flock_root.display().to_string()
     )).unwrap();
     let outcome = Command::new(env!("CARGO_BIN_EXE_mato"))
         .args(["run", "--config"])

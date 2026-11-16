@@ -60,10 +60,6 @@ fn recorded_annotation_errors_allow_enrichment_and_retry_after_taxon_resolution(
         db.execute("INSERT INTO processed_spectra(dataset_id,filename,ms2_path,ms2_sha256,features_path) VALUES(1,?1,?2,?3,?2)", params![name, ms2.to_str().unwrap(), digest]).unwrap();
     }
     let config = dir.join("job.toml");
-    let indexes_config = dir.join("wikidata.toml");
-    fs::write(&indexes_config,
-        "[indexes]\ntaxon_index = \"taxa.sqlite\"\nchemical_index = \"chemicals.sqlite\"\n"
-    ).unwrap();
     let chemicals = Connection::open(dir.join("chemicals.sqlite")).unwrap();
     chemicals.execute_batch(
         "CREATE TABLE wikidata_chemical_snapshot(
@@ -79,8 +75,8 @@ fn recorded_annotation_errors_allow_enrichment_and_retry_after_taxon_resolution(
     ).unwrap();
     let flock_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     fs::write(&config, format!(
-        "flock_root = {:?}\nwikidata_config = \"wikidata.toml\"\n[pipeline]\nstages = [\"annotate\", \"chemical_enrich\"]\n[dataset]\nroot = {:?}\ndoi = \"doi\"\nmetadata = \"metadata.tsv\"\nms_dir = \"raw\"\ntaxon_column = \"taxon\"\n[database]\npath = {:?}\n[picoto]\noutput_dir = {:?}\njobs = 1\n[annotation]\nlibrary = {:?}\nlotus_csv = {:?}\nsettings = {:?}\n",
-        flock_root.display().to_string(), dataset.display().to_string(), db_path.display().to_string(), dir.join("picoto").display().to_string(), dir.join("library.mgf").display().to_string(), dir.join("lotus.csv").display().to_string(), dir.join("settings.toml").display().to_string()
+        "workspace = {:?}\nflock_root = {:?}\n[pipeline]\nstages = [\"annotate\", \"chemical_enrich\"]\n[dataset]\nroot = \"dataset\"\ndoi = \"doi\"\nmetadata = \"metadata.tsv\"\nms_dir = \"raw\"\ntaxon_column = \"taxon\"\n[database]\npath = \"flock.sqlite\"\n[picoto]\noutput_dir = \"picoto\"\njobs = 1\n[annotation]\nlibrary = \"library.mgf\"\nlotus_csv = \"lotus.csv\"\nsettings = \"settings.toml\"\n[indexes]\ntaxon_index = \"taxa.sqlite\"\nchemical_index = \"chemicals.sqlite\"\n[knowledge_graph]\noutput_dir = \"toy-kg\"\n",
+        dir.display().to_string(), flock_root.display().to_string()
     )).unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_mato"))

@@ -324,7 +324,6 @@ pub(crate) fn write(
         ("Spectral library", &config.library),
         ("LOTUS CSV", &config.lotus_csv),
         ("Matcher settings", &config.settings),
-        ("Shared Wikidata indexes TOML", &config.indexes_config),
         ("Shared Wikidata taxon index", &config.taxon_index),
         ("Shared Wikidata chemical index", &config.chemical_index),
     ] {

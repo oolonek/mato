@@ -98,7 +98,6 @@ pub(crate) fn inspect(config: &Config) -> Result<()> {
             "missing"
         }
     );
-    println!("Wikidata indexes config: {}", config.indexes_config.display());
     println!("Wikidata taxon index: {} ({})", config.taxon_index.display(),
         if config.taxon_index.is_file() { "present" } else { "missing" });
     println!("Wikidata chemical index: {} ({})", config.chemical_index.display(),

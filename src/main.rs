@@ -1,4 +1,6 @@
 mod config;
+mod bootstrap;
+mod bootstrap_artifacts;
 mod job;
 mod report;
 
@@ -28,6 +30,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Action {
+    /// Fetch and verify the toy inputs, run the full pipeline, export and validate a fresh KG.
+    Bootstrap {
+        /// Single workspace-root job config; data need not have been downloaded yet.
+        #[arg(long)]
+        config: PathBuf,
+    },
     /// Run the stages selected in a TOML file in flock order.
     Run {
         #[arg(long)]
@@ -80,9 +88,9 @@ enum Action {
 enum IndexAction {
     /// Download both QLever snapshots, or only one of them.
     Refresh {
-        /// Alternate shared-index TOML; defaults to mato/config/wikidata.toml.
+        /// The same one-file Mato job config used by run and bootstrap.
         #[arg(long)]
-        config: Option<PathBuf>,
+        config: PathBuf,
         #[arg(long)]
         only: Option<IndexKind>,
     },
@@ -140,8 +148,7 @@ fn binary(flock_root: &Path, species: &'static str) -> Result<PathBuf> {
     Ok(binary)
 }
 
-fn refresh_indexes(config: Option<PathBuf>, only: Option<IndexKind>) -> Result<()> {
-    let config = config.unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("config/wikidata.toml"));
+fn refresh_indexes(config: PathBuf, only: Option<IndexKind>) -> Result<()> {
     let indexes = SharedIndexes::load(&config)?;
     let flock_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent().context("Mato source tree has no parent")?;
@@ -630,6 +637,7 @@ fn run_reported(path: &Path, verbose: bool, top_n: Option<usize>) -> Result<()> 
 
 fn main() -> Result<()> {
     match Cli::parse().command {
+        Action::Bootstrap { config } => bootstrap::run(&config),
         Action::Run { config, verbose, top_n } => run_reported(&config, verbose, top_n),
         Action::Indexes { action: IndexAction::Refresh { config, only } } =>
             refresh_indexes(config, only),
@@ -719,7 +727,6 @@ exit 1
             lotus_csv: PathBuf::new(),
             settings: PathBuf::new(),
             chemical_index: PathBuf::new(),
-            indexes_config: PathBuf::new(),
         };
         register(&config, &binary, &files, false).unwrap();
     }

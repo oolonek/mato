@@ -23,8 +23,8 @@ impl Job {
         fs::write(
             &config,
             format!(
-                "flock_root = {:?}\n[pipeline]\nstages = [\"validate\", \"ingest\"]\n[dataset]\nroot = \"dataset\"\ndoi = \"10.1234/example\"\nmetadata = \"metadata.tsv\"\nms_dir = \"raw\"\ntaxon_column = \"taxon\"\n[database]\npath = \"job.sqlite\"\n[picoto]\noutput_dir = \"picoto\"\njobs = 1\n[annotation]\nlibrary = \"unused.mgf\"\nlotus_csv = \"unused.csv\"\nsettings = \"unused.toml\"\n",
-                root.display().to_string()
+                "workspace = {:?}\nflock_root = {:?}\n[pipeline]\nstages = [\"validate\", \"ingest\"]\n[dataset]\nroot = \"dataset\"\ndoi = \"10.1234/example\"\nmetadata = \"metadata.tsv\"\nms_dir = \"raw\"\ntaxon_column = \"taxon\"\n[database]\npath = \"job.sqlite\"\n[picoto]\noutput_dir = \"picoto\"\njobs = 1\n[annotation]\nlibrary = \"unused.mgf\"\nlotus_csv = \"unused.csv\"\nsettings = \"unused.toml\"\n[indexes]\ntaxon_index = \"taxa.sqlite\"\nchemical_index = \"chemicals.sqlite\"\n[knowledge_graph]\noutput_dir = \"toy-kg\"\n",
+                temporary.path().display().to_string(), root.display().to_string()
             ),
         )
         .unwrap();

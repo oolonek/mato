@@ -106,14 +106,8 @@ struct Indexes {
     chemical_endpoint: Option<String>,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct IndexesFile {
-    indexes: Indexes,
-}
 
 pub(crate) struct SharedIndexes {
-    pub(crate) path: PathBuf,
     pub(crate) taxon_index: PathBuf,
     pub(crate) chemical_index: PathBuf,
     pub(crate) taxon_endpoint: Option<String>,
@@ -122,16 +116,13 @@ pub(crate) struct SharedIndexes {
 
 impl SharedIndexes {
     pub(crate) fn load(path: &Path) -> Result<Self> {
-        let path = existing_file(path, "Wikidata index config")?;
-        let dir = path.parent().context("Wikidata index config has no parent")?;
-        let file: IndexesFile = toml::from_str(&std::fs::read_to_string(&path)?)
-            .with_context(|| format!("parsing {}", path.display()))?;
+        let (_, dir, file) = load_file(path)?;
+        let workspace = comparison_path(&relative_to(&dir, &file.workspace))?;
         Ok(Self {
-            taxon_index: relative_to(dir, &file.indexes.taxon_index),
-            chemical_index: relative_to(dir, &file.indexes.chemical_index),
+            taxon_index: relative_to(&workspace, &file.indexes.taxon_index),
+            chemical_index: relative_to(&workspace, &file.indexes.chemical_index),
             taxon_endpoint: file.indexes.taxon_endpoint,
             chemical_endpoint: file.indexes.chemical_endpoint,
-            path,
         })
     }
 }
@@ -152,15 +143,22 @@ struct Annotation {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct KnowledgeGraph {
+    output_dir: PathBuf,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FileConfig {
+    workspace: PathBuf,
     flock_root: PathBuf,
-    #[serde(default)]
-    wikidata_config: Option<PathBuf>,
     pipeline: Pipeline,
     dataset: Dataset,
     database: Database,
     picoto: Picoto,
+    indexes: Indexes,
     annotation: Annotation,
+    knowledge_graph: KnowledgeGraph,
     #[serde(default)]
     peregrino: Option<Peregrino>,
 }
@@ -177,13 +175,99 @@ pub(crate) struct Config {
     pub(crate) db: PathBuf,
     pub(crate) output_dir: PathBuf,
     pub(crate) picoto_jobs: usize,
-    pub(crate) indexes_config: PathBuf,
     pub(crate) taxon_index: PathBuf,
     pub(crate) peregrino_jobs: usize,
     pub(crate) library: PathBuf,
     pub(crate) lotus_csv: PathBuf,
     pub(crate) settings: PathBuf,
     pub(crate) chemical_index: PathBuf,
+}
+
+pub(crate) struct BootstrapPaths {
+    pub(crate) flock_root: PathBuf,
+    pub(crate) workspace_root: PathBuf,
+    pub(crate) dataset_root: PathBuf,
+    pub(crate) doi: String,
+    pub(crate) library: PathBuf,
+    pub(crate) lotus_csv: PathBuf,
+    pub(crate) taxon_index: PathBuf,
+    pub(crate) chemical_index: PathBuf,
+    pub(crate) graph_dir: PathBuf,
+}
+
+fn load_file(path: &Path) -> Result<(PathBuf, PathBuf, FileConfig)> {
+    let path = existing_file(path, "job config")?;
+    let dir = path.parent().context("job config has no parent")?.to_path_buf();
+    let file = toml::from_str(&std::fs::read_to_string(&path)?)
+        .with_context(|| format!("parsing {}", path.display()))?;
+    Ok((path, dir, file))
+}
+
+pub(crate) fn bootstrap_paths(path: &Path) -> Result<BootstrapPaths> {
+    let (_, dir, file) = load_file(path)?;
+    let workspace_root = comparison_path(&relative_to(&dir, &file.workspace))?;
+    let flock_root = comparison_path(&relative_to(&dir, &file.flock_root))?;
+    let dataset_root = comparison_path(&relative_to(&workspace_root, &file.dataset.root))?;
+    let db = comparison_path(&relative_to(&workspace_root, &file.database.path))?;
+    let output_dir = comparison_path(&relative_to(&workspace_root, &file.picoto.output_dir))?;
+    let library = comparison_path(&relative_to(&workspace_root, &file.annotation.library))?;
+    let lotus_csv = comparison_path(&relative_to(&workspace_root, &file.annotation.lotus_csv))?;
+    let taxon_index = comparison_path(&relative_to(&workspace_root, &file.indexes.taxon_index))?;
+    let chemical_index = comparison_path(&relative_to(&workspace_root, &file.indexes.chemical_index))?;
+    let graph_dir = comparison_path(&relative_to(&workspace_root, &file.knowledge_graph.output_dir))?;
+    for (name, path) in [
+        ("dataset", &dataset_root),
+        ("database", &db),
+        ("Picoto output", &output_dir),
+        ("annotation library", &library),
+        ("LOTUS metadata", &lotus_csv),
+        ("taxon index", &taxon_index),
+        ("chemical index", &chemical_index),
+        ("knowledge graph output", &graph_dir),
+    ] {
+        ensure!(
+            !path.starts_with(&flock_root),
+            "{name} must be outside the flock source tree: {}",
+            path.display()
+        );
+    }
+    for (name, path) in [
+        ("database", &db),
+        ("Picoto output", &output_dir),
+        ("taxon index", &taxon_index),
+        ("chemical index", &chemical_index),
+        ("annotation library", &library),
+        ("LOTUS metadata", &lotus_csv),
+        ("knowledge graph output", &graph_dir),
+    ] {
+        ensure!(
+            !path.starts_with(&dataset_root),
+            "{name} must be outside the dataset source tree: {}",
+            path.display()
+        );
+    }
+    ensure!(
+        db != taxon_index && db != chemical_index && taxon_index != chemical_index,
+        "job database and shared indexes must have distinct paths"
+    );
+    ensure!(
+        !graph_dir.starts_with(&output_dir)
+            && !output_dir.starts_with(&graph_dir)
+            && !dataset_root.starts_with(&output_dir)
+            && !dataset_root.starts_with(&graph_dir),
+        "Picoto and KG outputs must be separate directories outside the dataset source tree"
+    );
+    Ok(BootstrapPaths {
+        flock_root,
+        workspace_root,
+        dataset_root,
+        doi: file.dataset.doi,
+        library,
+        lotus_csv,
+        taxon_index,
+        chemical_index,
+        graph_dir,
+    })
 }
 
 fn relative_to(base: &Path, path: &Path) -> PathBuf {
@@ -274,10 +358,8 @@ impl Config {
         if let Some(n) = top_n {
             ensure!(n > 0, "--topN must be greater than zero");
         }
-        let path = existing_file(path, "pipeline config")?;
-        let dir = path.parent().context("pipeline config has no parent")?;
-        let file: FileConfig = toml::from_str(&std::fs::read_to_string(&path)?)
-            .with_context(|| format!("parsing {}", path.display()))?;
+        let (path, dir, file) = load_file(path)?;
+        let workspace = comparison_path(&relative_to(&dir, &file.workspace))?;
         check_stages(&file.pipeline.stages, "pipeline.stages")?;
         if let Some(stages) = &file.pipeline.top_n_stages {
             check_stages(stages, "pipeline.top_n_stages")?;
@@ -300,13 +382,8 @@ impl Config {
         let peregrino_jobs = file.peregrino.map_or(1, |peregrino| peregrino.jobs);
         ensure!(peregrino_jobs > 0, "peregrino.jobs must be positive");
 
-        let flock_root = existing_dir(&relative_to(dir, &file.flock_root), "flock root")?;
-        let indexes_path = file.wikidata_config.as_deref().map_or_else(
-            || flock_root.join("mato/config/wikidata.toml"),
-            |path| relative_to(dir, path),
-        );
-        let indexes = SharedIndexes::load(&indexes_path)?;
-        let dataset_root = existing_dir(&relative_to(dir, &file.dataset.root), "dataset root")?;
+        let flock_root = existing_dir(&relative_to(&dir, &file.flock_root), "flock root")?;
+        let dataset_root = existing_dir(&relative_to(&workspace, &file.dataset.root), "dataset root")?;
         let metadata = inside_dataset(&dataset_root, &file.dataset.metadata, false)?;
         let ms_dir = inside_dataset(&dataset_root, &file.dataset.ms_dir, true)?;
         let (stages, db, output_dir) = if let Some(n) = top_n {
@@ -319,12 +396,12 @@ impl Config {
                 .top_n_root
                 .as_deref()
                 .context("--topN requires [database].top_n_root in the job config")?;
-            let root = relative_to(dir, root);
+            let root = relative_to(&workspace, root);
             let base = root.join(n.to_string());
             let db = base.join("flock.sqlite");
             let output_dir = base.join("picoto");
-            let production_db = comparison_path(&relative_to(dir, &file.database.path))?;
-            let production_output = comparison_path(&relative_to(dir, &file.picoto.output_dir))?;
+            let production_db = comparison_path(&relative_to(&workspace, &file.database.path))?;
+            let production_output = comparison_path(&relative_to(&workspace, &file.picoto.output_dir))?;
             let limited_root = comparison_path(&root)?;
             let limited_base = comparison_path(&base)?;
             let limited_db = comparison_path(&db)?;
@@ -351,14 +428,14 @@ impl Config {
         } else {
             (
                 file.pipeline.stages,
-                relative_to(dir, &file.database.path),
-                relative_to(dir, &file.picoto.output_dir),
+                relative_to(&workspace, &file.database.path),
+                relative_to(&workspace, &file.picoto.output_dir),
             )
         };
         let annotation = stages.contains(&Stage::Annotate);
-        let library = relative_to(dir, &file.annotation.library);
-        let lotus_csv = relative_to(dir, &file.annotation.lotus_csv);
-        let settings = relative_to(dir, &file.annotation.settings);
+        let library = relative_to(&workspace, &file.annotation.library);
+        let lotus_csv = relative_to(&workspace, &file.annotation.lotus_csv);
+        let settings = relative_to(&dir, &file.annotation.settings);
         if annotation {
             existing_file(&library, "annotation library")?;
             existing_file(&lotus_csv, "LOTUS metadata")?;
@@ -369,7 +446,7 @@ impl Config {
             existing_file(&manifest, "species manifest")?;
         }
         Ok(Self {
-            path,
+            path: path.clone(),
             flock_root,
             stages,
             top_n,
@@ -380,13 +457,12 @@ impl Config {
             db,
             output_dir,
             picoto_jobs: file.picoto.jobs,
-            indexes_config: indexes.path,
-            taxon_index: indexes.taxon_index,
+            taxon_index: relative_to(&workspace, &file.indexes.taxon_index),
             peregrino_jobs,
             library,
             lotus_csv,
             settings,
-            chemical_index: indexes.chemical_index,
+            chemical_index: relative_to(&workspace, &file.indexes.chemical_index),
         })
     }
 }

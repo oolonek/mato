@@ -1,4 +1,5 @@
-# Portable example: copy to massive.local.toml and set real paths before inspecting.
+# Set workspace to an existing writable directory containing MassIVE data, references and job outputs.
+workspace = "/path/to/workspace"
 flock_root = "../.."
 
 [pipeline]
@@ -9,25 +10,32 @@ top_n_stages = ["validate", "ingest", "enrich", "picoto", "register", "annotate"
 
 
 [dataset]
-root = "/path/to/extracted/MSV000102993"
+root = "sapayoa/MSV000102993"
 doi = "10.25345/C55T3GD90"
 metadata = "metadata/metadata/dbgi_massive_metadata_20260806.tsv"
 ms_dir = "peak/peak"
 taxon_column = "taxon_scientific_name"
 
 [database]
-path = "/path/to/production/flock.sqlite"
-top_n_root = "/path/to/isolated/top-n"
+path = "peregrino/flock.sqlite"
+top_n_root = "mato/top-n"
 
 [peregrino]
 # Concurrent per-file Picoto registrations; ingestion remains transactional.
 jobs = 4
 
 [picoto]
-output_dir = "/path/to/production/picoto"
+output_dir = "picoto/massive"
 jobs = 25
 
 [annotation]
-library = "/path/to/references/isdb_lotus_pos_energySum.mgf"
-lotus_csv = "/path/to/references/230106_frozen_metadata.csv"
+library = "hocofaisan/references/isdb_lotus_pos_energySum.mgf"
+lotus_csv = "hocofaisan/references/230106_frozen_metadata.csv"
 settings = "../../hocofaisan/config/example.toml"
+
+[indexes]
+taxon_index = "mato/wikidata/taxa.sqlite"
+chemical_index = "mato/wikidata/chemicals.sqlite"
+
+[knowledge_graph]
+output_dir = "mato/massive-kg"

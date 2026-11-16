@@ -1,6 +1,6 @@
 # mato
 
-Mato coordinates the [Isla Gabriola flock](https://github.com/oolonek/isla-gabriola-flock/blob/main/README.md), a group of tools that connects research samples, mass-spectrometry measurements, and possible chemical matches into a traceable record that can become a searchable knowledge graph. Mato runs the steps you choose; it does not download the data or claim that a possible match identifies a chemical.
+Mato coordinates the [Isla Gabriola flock](https://github.com/oolonek/isla-gabriola-flock/blob/main/README.md), a group of tools that connects research samples, mass-spectrometry measurements, and possible chemical matches into a traceable record that can become a searchable knowledge graph. Its `bootstrap` command downloads and verifies the toy data and reference files, runs the complete pipeline, and exports and validates a KG; a possible match does not identify a chemical.
 
 The name Mato refers to a lizard: the giant ameiva, *[Ameiva atrigularis](https://www.wikidata.org/wiki/Q2842576)* ([Catalogue of Life: 66B76](https://www.catalogueoflife.org/data/taxon/66B76)).
 
@@ -10,11 +10,11 @@ Photo: [Charles J. Sharp](https://commons.wikimedia.org/wiki/File:Giant_ameiva_(
 
 ## In the flock
 
-After the data is downloaded and extracted, Mato asks the other species to check the files, record samples, find signals and compare spectra with references. Peregrino can then export a knowledge graph from the resulting record.
+For the toy dataset, Mato prepares the public inputs, builds shared Wikidata indexes, runs the species, and validates the resulting graph. Other dataset jobs use `mato run` with their own configured inputs and outputs.
 
 ## Start here
 
-New to the project? Start with the [plain-language flock overview](https://github.com/oolonek/isla-gabriola-flock/blob/main/README.md) to see why the species work together. To try the complete route from download to graph, follow the [small Zenodo toy walkthrough](TECHNICAL.md#example-download-the-zenodo-toy-dataset-and-export-a-kg); it lists the data, reference files and safety checks you need first.
+New to the project? Start with the [plain-language flock overview](https://github.com/oolonek/isla-gabriola-flock/blob/main/README.md). To try the complete route from download to validated graph, set `workspace` in a private copy of [the toy config](config/toy.toml), then run [the one-command toy bootstrap](TECHNICAL.md#example-download-the-zenodo-toy-dataset-and-export-a-kg). Rust and Cargo are required; Just and Python are not.
 
 ## Learn more
 
