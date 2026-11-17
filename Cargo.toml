@@ -8,17 +8,16 @@ license = "MIT OR Apache-2.0"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 flate2 = "1"
+csv = "1"
 indicatif = "0.18"
 md-5 = "0.10"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "native-tls"] }
 rusqlite = "0.37"
 serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
 serde_json = "1"
 sapayoa = { path = "../sapayoa" }
 tempfile = "3"
 toml = "0.9"
 walkdir = "2"
 zip = { version = "2", default-features = false, features = ["deflate"] }
-
-[dev-dependencies]
-sha2 = "0.10"

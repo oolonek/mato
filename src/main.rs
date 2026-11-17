@@ -1,8 +1,10 @@
 mod config;
-mod bootstrap;
-mod bootstrap_artifacts;
+mod inputs;
 mod job;
+mod index_recovery;
 mod report;
+mod qlever;
+mod selection;
 
 use std::collections::{BTreeSet, HashMap};
 use std::env;
@@ -17,7 +19,7 @@ use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 use walkdir::WalkDir;
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 use crate::config::{Config, SharedIndexes, Stage};
 
@@ -30,17 +32,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Action {
-    /// Fetch and verify the toy inputs, run the full pipeline, export and validate a fresh KG.
-    Bootstrap {
-        /// Single workspace-root job config; data need not have been downloaded yet.
-        #[arg(long)]
-        config: PathBuf,
-    },
     /// Run the stages selected in a TOML file in flock order.
     Run {
         #[arg(long)]
         config: PathBuf,
-        /// Run the first N metadata rows in an isolated top-N job configured in this TOML.
+        /// Take up to N rows after optional [selection] filters and sorting, in an isolated job.
         #[arg(long = "topN")]
         top_n: Option<usize>,
         /// Stream registration filenames and Cunaguaro per-name results.
@@ -56,18 +52,21 @@ enum Action {
     Inspect {
         #[arg(long)]
         config: PathBuf,
-        /// Inspect the isolated job for the first N metadata rows.
+        /// Inspect the isolated top-N job for this config's selection.
         #[arg(long = "topN")]
         top_n: Option<usize>,
     },
-    /// Delete this job's database and Picoto outputs permanently.
+    /// Delete this job's database and Picoto outputs permanently; optionally remove its KG and QLever backends.
     Reset {
         #[arg(long)]
         config: PathBuf,
-        /// Reset only the isolated job for the first N metadata rows.
+        /// Reset the isolated top-N job for this config's selection.
         #[arg(long = "topN")]
         top_n: Option<usize>,
-        /// Confirm deletion of the configured database and Picoto output directory.
+        /// Also delete this job's graph directory and its registered QLever engines, indexes and UI backends.
+        #[arg(long)]
+        kg: bool,
+        /// Confirm permanent deletion of the selected job outputs.
         #[arg(long, required = true)]
         yes: bool,
     },
@@ -76,11 +75,43 @@ enum Action {
         table: String,
         #[arg(long)]
         config: PathBuf,
-        /// Preview the isolated job for the first N metadata rows.
+        /// Preview the isolated top-N job for this config's selection.
         #[arg(long = "topN")]
         top_n: Option<usize>,
         #[arg(long, default_value_t = 20)]
         limit: usize,
+    },
+    /// Index an exported graph and manage its loopback QLever server and shared UI.
+    Qlever {
+        #[command(subcommand)]
+        action: QleverAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum QleverAction {
+    /// Build a new index without copying the graph, serve it, and add it to the shared UI.
+    Add {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        graph: PathBuf,
+        /// Stable lowercase backend slug; a changed graph needs a new name.
+        #[arg(long)]
+        name: String,
+        /// Unused server/laptop port for this graph's SPARQL API.
+        #[arg(long)]
+        port: u16,
+    },
+    /// Print the SSH forwards and UI links for every registered graph.
+    Access {
+        #[arg(long)]
+        config: PathBuf,
+        /// Reachable SSH account from the laptop, such as allardpm@allardpm-commons.
+        #[arg(long)]
+        ssh: String,
+        #[arg(long, default_value_t = 17044)]
+        local_ui_port: u16,
     },
 }
 
@@ -88,7 +119,15 @@ enum Action {
 enum IndexAction {
     /// Download both QLever snapshots, or only one of them.
     Refresh {
-        /// The same one-file Mato job config used by run and bootstrap.
+        /// The same one-file Mato job config used by run.
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        only: Option<IndexKind>,
+    },
+    /// Roll back an interrupted SQLite journal and verify existing snapshots; no QLever download.
+    Recover {
+        /// The same one-file Mato job config used by run.
         #[arg(long)]
         config: PathBuf,
         #[arg(long)]
@@ -445,22 +484,124 @@ fn register(config: &Config, binary: &Path, files: &[PathBuf], verbose: bool) ->
     })
 }
 
+#[derive(Default)]
+struct GraphProgress {
+    path: Option<PathBuf>,
+    validated: bool,
+}
+
+fn current_dataset(db: &Connection, config: &Config) -> Result<i64> {
+    db.query_row(
+        "SELECT id FROM datasets WHERE doi=?1 AND root=?2 AND metadata_path=?3",
+        params![
+            config.doi,
+            config.dataset_root.to_str().context("non-UTF-8 dataset root")?,
+            config.metadata.to_str().context("non-UTF-8 metadata path")?
+        ],
+        |row| row.get(0),
+    ).with_context(|| format!("configured dataset is not ingested in {}", config.db.display()))
+}
+
+fn current_annotation_errors(db: &Connection, dataset_id: i64) -> Result<i64> {
+    let view: i64 = db.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='view' AND name='annotation_current_runs'",
+        [], |row| row.get(0),
+    )?;
+    if view == 0 {
+        return Ok(0);
+    }
+    Ok(db.query_row(
+        "SELECT COUNT(*) FROM annotation_current_runs WHERE dataset_id=?1 AND status='error'",
+        [dataset_id], |row| row.get(0),
+    )?)
+}
+
+fn export_graph(config: &Config, executable: &Path, dataset_id: i64, partial: bool, graph: &mut GraphProgress) -> Result<()> {
+    std::fs::create_dir_all(&config.graph_dir)
+        .with_context(|| format!("creating KG directory {}", config.graph_dir.display()))?;
+    let prefix = if partial { "graph-partial-" } else { "graph-" };
+    let unique = tempfile::Builder::new().prefix(prefix).suffix(".nq")
+        .tempfile_in(&config.graph_dir)?;
+    let path = unique.path().to_path_buf();
+    unique.close()?;
+    let mut command = Command::new(executable);
+    command.arg("kg").arg("export").arg("--db").arg(&config.db)
+        .arg("--dataset-id").arg(dataset_id.to_string())
+        .arg("--out").arg(&path);
+    let exported = status(command, "exporting linked N-Quads graph");
+    if exported.is_err() {
+        let _ = std::fs::remove_file(&path);
+    }
+    exported?;
+    eprintln!("🦎 mato: KG exported: {}", path.display());
+    let manifest = config.flock_root.join("peregrino/Cargo.toml");
+    let query = config.flock_root.join("peregrino/kg/coverage.rq");
+    eprintln!(
+        "🦎 mato: query: cargo run --release --manifest-path {} -- kg query --graph {} --query {}",
+        report::quote_shell(&manifest),
+        report::quote_shell(&path),
+        report::quote_shell(&query),
+    );
+    graph.path = Some(path);
+    if partial {
+        eprintln!("🦎 mato: graph is partial; failed annotation files remain in annotation_current_runs");
+    }
+    Ok(())
+}
+
+fn validate_graph(executable: &Path, graph: &mut GraphProgress) -> Result<()> {
+    let path = graph.path.as_ref().context("kg_validate requires a graph exported in this job")?;
+    let mut command = Command::new(executable);
+    command.arg("kg").arg("validate").arg("--graph").arg(path);
+    status(command, "validating exported KG with SHACL")?;
+    graph.validated = true;
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 enum RunStatus { Complete, Partial }
 
-fn run(config: &Config, verbose: bool, max_rows: Option<usize>) -> Result<RunStatus> {
+fn require_index(config: &Config, kind: IndexKind) -> Result<()> {
+    let (name, path, snapshot) = match kind {
+        IndexKind::Taxon => ("taxon", &config.taxon_index,
+            "SELECT generation,names FROM wikidata_taxon_snapshot WHERE id=1"),
+        IndexKind::Chemical => ("chemical", &config.chemical_index,
+            "SELECT generation,pairs FROM wikidata_chemical_snapshot WHERE id=1"),
+    };
+    let complete = if path.exists() {
+        let metadata = std::fs::symlink_metadata(path)?;
+        ensure!(metadata.file_type().is_file(), "{name} index is not a regular file: {}", path.display());
+        if metadata.len() == 0 {
+            false
+        } else {
+            let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .with_context(|| format!("opening shared {name} index {}; if a hot journal remains, run mato indexes recover --only {name}", path.display()))?;
+            let snapshot: Option<(i64, i64)> = db.query_row(snapshot, [], |row| Ok((row.get(0)?, row.get(1)?)))
+                .optional().with_context(|| format!("reading shared {name} snapshot {}; if a hot journal remains, run mato indexes recover --only {name}", path.display()))?;
+            snapshot.is_some_and(|(generation, rows)| generation > 0 && rows > 0)
+        }
+    } else {
+        false
+    };
+    if complete {
+        return Ok(());
+    }
+    ensure!(config.create_missing_indexes,
+        "shared Wikidata {name} index missing or incomplete: {} (enable indexes.create_missing or run mato indexes refresh --config {} --only {name})",
+        path.display(), config.path.display());
+    eprintln!("🦎 mato: preparing shared Wikidata {name} index: {}", path.display());
+    refresh_indexes(config.path.clone(), Some(kind))
+}
+
+fn run(config: &Config, verbose: bool, max_rows: Option<usize>, graph: &mut GraphProgress) -> Result<RunStatus> {
     if let Some(max_rows) = max_rows {
         ensure!(max_rows > 0, "--topN must be positive");
     }
     if config.stages.contains(&Stage::Enrich) {
-        ensure!(config.taxon_index.is_file(),
-            "shared Wikidata taxon index missing: {} (run mato indexes refresh --only taxon)",
-            config.taxon_index.display());
+        require_index(config, IndexKind::Taxon)?;
     }
     if config.stages.contains(&Stage::ChemicalEnrich) {
-        ensure!(config.chemical_index.is_file(),
-            "shared Wikidata chemical index missing: {} (run mato indexes refresh --only chemical)",
-            config.chemical_index.display());
+        require_index(config, IndexKind::Chemical)?;
     }
     let mut built = HashMap::new();
     let mut raw = None;
@@ -496,6 +637,23 @@ fn run(config: &Config, verbose: bool, max_rows: Option<usize>) -> Result<RunSta
                 raw.as_deref().context("raw spectra missing")?,
                 verbose,
             )?,
+            Stage::KgExport => {
+                let db = Connection::open_with_flags(&config.db, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .with_context(|| format!("opening KG source database {}", config.db.display()))?;
+                let dataset_id = current_dataset(&db, config)?;
+                let errors = current_annotation_errors(&db, dataset_id)?;
+                if errors > 0 {
+                    partial_annotation = true;
+                    eprintln!("🦎 mato: {errors} current annotation files failed; graph cannot be called complete");
+                }
+                if partial_annotation && !config.allow_partial {
+                    eprintln!("🦎 mato: skipping KG export: set knowledge_graph.allow_partial=true to publish an explicitly partial graph");
+                    return Ok(RunStatus::Partial);
+                }
+                drop(db);
+                export_graph(config, executable, dataset_id, partial_annotation, graph)?;
+            }
+            Stage::KgValidate => validate_graph(executable, graph)?,
             _ => {
                 let mut command = Command::new(executable);
                 let mut selected = None;
@@ -577,7 +735,7 @@ fn run(config: &Config, verbose: bool, max_rows: Option<usize>) -> Result<RunSta
                             command.arg("--verbose");
                         }
                     }
-                    Stage::Register => unreachable!(),
+                    Stage::Register | Stage::KgExport | Stage::KgValidate => unreachable!(),
                 }
                 if let Some(manifest) = &selected {
                     command.arg("--files-from").arg(manifest.path());
@@ -606,15 +764,27 @@ fn run(config: &Config, verbose: bool, max_rows: Option<usize>) -> Result<RunSta
 }
 
 fn run_reported(path: &Path, verbose: bool, top_n: Option<usize>) -> Result<()> {
+    config::prepare_inputs(path, top_n)?;
     let config = Config::load(path, top_n)?;
     let started = report::start(&config);
-    let outcome = run(&config, verbose, top_n);
+    let mut graph = GraphProgress::default();
+    let outcome = (|| {
+        if let Some(limit) = top_n {
+            limited_db(&config, limit)?;
+        }
+        if let (Some(source), Some(selection), Some(limit)) =
+            (config.source_metadata.as_deref(), config.selection.as_ref(), top_n)
+        {
+            selection::materialize(&config.dataset_root, source, &config.metadata, selection, limit)?;
+        }
+        run(&config, verbose, top_n, &mut graph)
+    })();
     let status = match &outcome {
         Ok(RunStatus::Complete) => "complete",
         Ok(RunStatus::Partial) => "partial",
         Err(_) => "failed",
     };
-    let saved = report::write(&config, top_n, &started, status, outcome.as_ref().err());
+    let saved = report::write(&config, top_n, &started, status, outcome.as_ref().err(), graph.path.as_deref(), graph.validated);
     match &saved {
         Ok(path) => eprintln!("🐦 flock: 🦎 mato report: {}", path.display()),
         Err(error) => eprintln!("🐦 flock: 🦎 mato could not write run report: {error:#}"),
@@ -637,12 +807,17 @@ fn run_reported(path: &Path, verbose: bool, top_n: Option<usize>) -> Result<()> 
 
 fn main() -> Result<()> {
     match Cli::parse().command {
-        Action::Bootstrap { config } => bootstrap::run(&config),
         Action::Run { config, verbose, top_n } => run_reported(&config, verbose, top_n),
         Action::Indexes { action: IndexAction::Refresh { config, only } } =>
             refresh_indexes(config, only),
+        Action::Indexes { action: IndexAction::Recover { config, only } } =>
+            index_recovery::run(&config, only),
+        Action::Qlever { action: QleverAction::Add { config, graph, name, port } } =>
+            qlever::add(&config, &graph, &name, port),
+        Action::Qlever { action: QleverAction::Access { config, ssh, local_ui_port } } =>
+            qlever::access(&config, &ssh, local_ui_port),
         Action::Inspect { config, top_n } => job::inspect(&Config::load(&config, top_n)?),
-        Action::Reset { config, top_n, yes: _ } => job::reset(&Config::load(&config, top_n)?),
+        Action::Reset { config, top_n, kg, yes: _ } => job::reset(&Config::load(&config, top_n)?, kg),
         Action::Show { config, top_n, table, limit } => {
             let config = Config::load(&config, top_n)?;
             job::require_db(&config)?;
@@ -717,6 +892,8 @@ exit 1
             dataset_root: root.to_path_buf(),
             doi: String::new(),
             metadata: PathBuf::new(),
+            source_metadata: None,
+            selection: None,
             ms_dir,
             db: root.join("unused.sqlite"),
             output_dir,
@@ -727,6 +904,9 @@ exit 1
             lotus_csv: PathBuf::new(),
             settings: PathBuf::new(),
             chemical_index: PathBuf::new(),
+            graph_dir: PathBuf::new(),
+            allow_partial: false,
+            create_missing_indexes: false,
         };
         register(&config, &binary, &files, false).unwrap();
     }

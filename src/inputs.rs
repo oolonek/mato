@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -12,25 +12,36 @@ use tempfile::NamedTempFile;
 use walkdir::WalkDir;
 use zip::ZipArchive;
 
-use crate::config::BootstrapPaths;
+pub(crate) struct Archive {
+    pub(crate) doi: String,
+}
 
-const CONCEPT_DOI: &str = "10.5281/zenodo.10018264";
-// Fetch the immutable release, not the concept DOI (which can resolve to a newer release).
-const RELEASE_DOI: &str = "10.5281/zenodo.10018590";
-const DATASET_DIR: &str = "sapayoa/zenodo-10018590";
-const LIBRARY_URL: &str =
-    "https://zenodo.org/records/14887271/files/isdb_lotus_pos_energySum.mgf?download=1";
-const LIBRARY_MD5: &str = "c025e3365ca913b46ec4f6637d381911";
-const LOTUS_URL: &str =
-    "https://zenodo.org/records/7534071/files/230106_frozen_metadata.csv.gz?download=1";
-const LOTUS_MD5: &str = "324579ae4a4785bf1b50b532b0a00eec";
+pub(crate) struct Download {
+    pub(crate) url: String,
+    pub(crate) md5: String,
+    pub(crate) compression: Option<Compression>,
+}
 
-pub(crate) fn prepare(paths: &BootstrapPaths) -> Result<()> {
-    ensure!(
-        paths.doi == CONCEPT_DOI,
-        "toy bootstrap requires dataset DOI {CONCEPT_DOI}, got {}",
-        paths.doi
-    );
+pub(crate) enum Compression {
+    Gzip,
+}
+
+pub(crate) struct InputSpec {
+    pub(crate) workspace_root: PathBuf,
+    pub(crate) dataset_root: PathBuf,
+    pub(crate) metadata: PathBuf,
+    pub(crate) ms_dir: PathBuf,
+    pub(crate) archive: Option<Archive>,
+    pub(crate) library: PathBuf,
+    pub(crate) lotus_csv: PathBuf,
+    pub(crate) library_source: Option<Download>,
+    pub(crate) lotus_source: Option<Download>,
+}
+
+pub(crate) fn prepare(paths: &InputSpec) -> Result<()> {
+    if paths.archive.is_none() && paths.library_source.is_none() && paths.lotus_source.is_none() {
+        return Ok(());
+    }
     ensure!(
         paths.workspace_root.is_absolute(),
         "workspace root must be absolute: {}",
@@ -44,74 +55,92 @@ pub(crate) fn prepare(paths: &BootstrapPaths) -> Result<()> {
         "workspace root is not a real directory: {}",
         paths.workspace_root.display()
     );
-    ensure!(
-        paths.dataset_root == paths.workspace_root.join(DATASET_DIR),
-        "toy dataset root must be {DATASET_DIR} inside the configured workspace: {}",
-        paths.dataset_root.display()
-    );
-    for (path, label) in [
-        (&paths.library, "spectral library"),
-        (&paths.lotus_csv, "LOTUS CSV"),
-    ] {
-        ensure!(path.is_absolute(), "{label} path must be absolute: {}", path.display());
-        let relative = path.strip_prefix(&paths.workspace_root).with_context(|| {
-            format!("{label} must be inside workspace: {}", path.display())
-        })?;
+    if let Some(archive) = &paths.archive {
+        let record_id = archive.doi.strip_prefix("10.5281/zenodo.")
+            .filter(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
+            .with_context(|| format!("archive DOI must identify a specific Zenodo release: {}", archive.doi))?;
+        safe_destination(&paths.workspace_root, &paths.dataset_root, "dataset root")?;
+        for (path, label) in [
+            (&paths.metadata, "metadata"),
+            (&paths.ms_dir, "spectra directory"),
+        ] {
+            safe_destination(&paths.dataset_root, path, label)?;
+        }
+        ensure_directory(&paths.workspace_root, &paths.dataset_root)?;
+        let manifest = paths.dataset_root.join("sapayoa-manifest.jsonl");
+        let receipt_present = regular_file(&manifest)?;
+        let ready = receipt_present && regular_file(&paths.metadata)?
+            && paths.ms_dir.symlink_metadata().is_ok_and(|meta| meta.file_type().is_dir());
+        if ready {
+            verified_archive(&paths.dataset_root, &archive.doi, record_id)?;
+        } else {
+            sapayoa::fetch(&archive.doi, &paths.dataset_root, Some(1), 1, false)
+                .map_err(|error| anyhow::anyhow!("Sapayoa fetch for {} failed: {error}; keep existing data and inspect the Sapayoa manifest before retrying", archive.doi))?;
+            let zip = verified_archive(&paths.dataset_root, &archive.doi, record_id)?;
+            extract_verified(&paths.dataset_root, &zip)?;
+        }
         ensure!(
-            relative.components().all(|component| matches!(component, Component::Normal(_)))
-                && !relative.as_os_str().is_empty()
-                && !path.starts_with(&paths.dataset_root),
-            "unsafe {label} destination: {}",
-            path.display()
+            regular_file(&paths.metadata)?,
+            "archive is missing metadata: {}",
+            paths.metadata.display()
+        );
+        ensure!(
+            paths.ms_dir.symlink_metadata().is_ok_and(|meta| meta.file_type().is_dir()),
+            "archive is missing spectra directory: {}",
+            paths.ms_dir.display()
+        );
+        ensure!(
+            WalkDir::new(&paths.ms_dir).min_depth(1).into_iter().any(|entry| {
+                entry.is_ok_and(|entry| entry.file_type().is_file())
+            }),
+            "archive has no raw spectra in {}",
+            paths.ms_dir.display()
         );
     }
-    ensure!(
-        paths.library != paths.lotus_csv && paths.lotus_csv.extension().is_some_and(|ext| ext == "csv"),
-        "reference paths must be distinct, and the LOTUS destination must end in .csv"
-    );
-    let mut compressed = paths.lotus_csv.as_os_str().to_os_string();
-    compressed.push(".gz");
-    let compressed = PathBuf::from(compressed);
-    ensure!(
-        compressed != paths.library,
-        "spectral library and compressed LOTUS file must have different paths"
-    );
-    ensure_directory(&paths.workspace_root, &paths.dataset_root)?;
-    // Sapayoa appends receipts; never let an existing manifest redirect that write.
-    regular_file(&paths.dataset_root.join("sapayoa-manifest.jsonl"))?;
-
-    sapayoa::fetch(RELEASE_DOI, &paths.dataset_root, None, 1, false)
-        .map_err(|error| anyhow::anyhow!("Sapayoa fetch for pinned {RELEASE_DOI} failed: {error}; keep existing data and inspect the Sapayoa manifest before retrying"))?;
-    let archive = single_archive(&paths.dataset_root)?;
-    verify_manifest(&paths.dataset_root, &archive)?;
-    extract_verified(&paths.dataset_root, &archive)?;
-    ensure!(
-        regular_file(&paths.dataset_root.join("metadata/metadata.tsv"))?,
-        "toy archive is missing metadata/metadata.tsv in {}",
-        paths.dataset_root.display()
-    );
-    let raw = paths.dataset_root.join("msdata/raw");
-    ensure!(
-        raw.symlink_metadata().is_ok_and(|meta| meta.file_type().is_dir()),
-        "toy archive is missing msdata/raw in {}",
-        paths.dataset_root.display()
-    );
-    ensure!(
-        WalkDir::new(&raw).min_depth(1).into_iter().any(|entry| {
-            entry.is_ok_and(|entry| entry.file_type().is_file())
-        }),
-        "toy archive has no raw spectra in {}",
-        raw.display()
-    );
-
-    let client = Client::builder()
-        .user_agent(concat!("mato/", env!("CARGO_PKG_VERSION")))
-        .timeout(Duration::from_secs(180))
-        .build()?;
-    download_checked(&client, LIBRARY_URL, LIBRARY_MD5, &paths.workspace_root, &paths.library)?;
-    download_checked(&client, LOTUS_URL, LOTUS_MD5, &paths.workspace_root, &compressed)?;
-    decompress_checked(&paths.workspace_root, &compressed, &paths.lotus_csv)?;
+    let client = if paths.library_source.is_some() || paths.lotus_source.is_some() {
+        Some(Client::builder()
+            .user_agent(concat!("mato/", env!("CARGO_PKG_VERSION")))
+            .timeout(Duration::from_secs(180))
+            .build()?)
+    } else {
+        None
+    };
+    if let Some(source) = &paths.library_source {
+        prepare_download(client.as_ref().unwrap(), source, &paths.workspace_root, &paths.library)?;
+    }
+    if let Some(source) = &paths.lotus_source {
+        prepare_download(client.as_ref().unwrap(), source, &paths.workspace_root, &paths.lotus_csv)?;
+    }
     Ok(())
+}
+
+fn safe_destination(root: &Path, path: &Path, label: &str) -> Result<()> {
+    ensure!(path.is_absolute(), "{label} path must be absolute: {}", path.display());
+    let relative = path.strip_prefix(root).with_context(|| {
+        format!("{label} must be inside {}: {}", root.display(), path.display())
+    })?;
+    ensure!(
+        !relative.as_os_str().is_empty()
+            && relative.components().all(|component| matches!(component, Component::Normal(_))),
+        "unsafe {label} destination: {}",
+        path.display()
+    );
+    Ok(())
+}
+
+fn prepare_download(client: &Client, source: &Download, root: &Path, target: &Path) -> Result<()> {
+    safe_destination(root, target, "reference")?;
+    match source.compression {
+        None => download_checked(client, &source.url, &source.md5, root, target),
+        Some(Compression::Gzip) => {
+            let mut compressed = target.as_os_str().to_os_string();
+            compressed.push(".gz");
+            let compressed = PathBuf::from(compressed);
+            safe_destination(root, &compressed, "compressed reference")?;
+            download_checked(client, &source.url, &source.md5, root, &compressed)?;
+            decompress_checked(root, &compressed, target)
+        }
+    }
 }
 
 // Create each component separately: create_dir_all would silently follow a preexisting symlink.
@@ -152,40 +181,29 @@ fn regular_file(path: &Path) -> Result<bool> {
     }
 }
 
-fn single_archive(root: &Path) -> Result<PathBuf> {
-    let mut archive = None;
-    for entry in fs::read_dir(root)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "zip") {
-            ensure!(regular_file(&path)?, "archive missing: {}", path.display());
-            ensure!(archive.is_none(), "multiple Zenodo ZIP archives in {}", root.display());
-            archive = Some(path);
-        }
-    }
-    archive.with_context(|| format!("expected exactly one Zenodo ZIP archive in {}", root.display()))
-}
-
-fn verify_manifest(root: &Path, archive: &Path) -> Result<()> {
+fn verified_archive(root: &Path, doi: &str, record_id: &str) -> Result<PathBuf> {
     let manifest = root.join("sapayoa-manifest.jsonl");
     ensure!(regular_file(&manifest)?, "Sapayoa manifest missing: {}", manifest.display());
-    let archive_name = archive.strip_prefix(root)?;
-    let mut found = false;
+    let mut archive = None;
     for line in BufReader::new(File::open(&manifest)?).lines() {
         let receipt: sapayoa::Receipt = serde_json::from_str(&line?)
             .with_context(|| format!("invalid Sapayoa manifest {}", manifest.display()))?;
         ensure!(
-            receipt.doi == RELEASE_DOI && receipt.accession == "zenodo:10018590"
-                && !receipt.version.is_empty(),
-            "Sapayoa manifest is not the pinned Zenodo record 10018590; preserve the existing dataset and choose a separate workspace for this toy release"
+            receipt.doi == doi
+                && receipt.accession.strip_prefix("zenodo:") == Some(record_id)
+                && !receipt.version.is_empty()
+                && receipt.path.extension().is_some_and(|ext| ext == "zip")
+                && !receipt.path.as_os_str().is_empty()
+                && receipt.path.components().all(|component| matches!(component, Component::Normal(_))),
+            "Sapayoa manifest does not track a ZIP from the requested release: {}",
+            manifest.display()
         );
-        if receipt.path == archive_name {
-            ensure!(!found, "duplicate archive receipts in {}", manifest.display());
-            found = true;
-        }
+        ensure!(archive.is_none(), "expected exactly one ZIP receipt in {}", manifest.display());
+        archive = Some(root.join(receipt.path));
     }
-    ensure!(found, "Zenodo ZIP is not tracked by Sapayoa: {}", archive.display());
-    Ok(())
+    let archive = archive.with_context(|| format!("expected exactly one ZIP receipt in {}", manifest.display()))?;
+    ensure!(regular_file(&archive)?, "archive missing: {}", archive.display());
+    Ok(archive)
 }
 
 fn checked_entry_name(name: &[u8]) -> Result<PathBuf> {
@@ -200,10 +218,8 @@ fn checked_entry_name(name: &[u8]) -> Result<PathBuf> {
     let relative = Path::new(name);
     ensure!(
         relative.components().all(|component| matches!(component, Component::Normal(_)))
-            && relative.components().next().is_some_and(|component| {
-                component.as_os_str() == "metadata" || component.as_os_str() == "msdata"
-            }),
-        "unexpected ZIP entry path: {name:?}"
+            && !relative.as_os_str().is_empty(),
+        "unsafe ZIP entry path: {name:?}"
     );
     Ok(relative.to_path_buf())
 }
@@ -213,12 +229,17 @@ fn extract_verified(root: &Path, archive_path: &Path) -> Result<()> {
         .with_context(|| format!("opening ZIP {}", archive_path.display()))?;
     let mut entries = Vec::with_capacity(archive.len());
     let mut explicit = HashMap::new();
-    let mut known = HashSet::new();
-    known.insert(PathBuf::from("sapayoa-manifest.jsonl"));
-    known.insert(archive_path.strip_prefix(root)?.to_path_buf());
+    let manifest = Path::new("sapayoa-manifest.jsonl");
+    let archive_name = archive_path.strip_prefix(root)?;
     for index in 0..archive.len() {
         let entry = archive.by_index(index)?;
         let relative = checked_entry_name(entry.name_raw())?;
+        ensure!(
+            relative != manifest && relative != archive_name
+                && (entry.is_dir() || (!manifest.starts_with(&relative) && !archive_name.starts_with(&relative))),
+            "ZIP entry conflicts with Sapayoa receipt or archive: {}",
+            relative.display()
+        );
         if let Some(mode) = entry.unix_mode() {
             let kind = mode & 0o170000;
             ensure!(
@@ -233,14 +254,9 @@ fn extract_verified(root: &Path, archive_path: &Path) -> Result<()> {
             "duplicate ZIP entry: {}",
             relative.display()
         );
-        known.insert(relative.clone());
-        for ancestor in relative.ancestors().skip(1) {
-            if ancestor.as_os_str().is_empty() { break; }
-            known.insert(ancestor.to_path_buf());
-        }
         entries.push((relative, entry.is_dir()));
     }
-    ensure!(!entries.is_empty(), "toy ZIP is empty: {}", archive_path.display());
+    ensure!(!entries.is_empty(), "ZIP is empty: {}", archive_path.display());
     for (relative, _) in &entries {
         for ancestor in relative.ancestors().skip(1) {
             ensure!(
@@ -249,21 +265,6 @@ fn extract_verified(root: &Path, archive_path: &Path) -> Result<()> {
                 ancestor.display()
             );
         }
-    }
-    // A previous extraction may have been interrupted, but untracked files cannot be trusted.
-    for entry in WalkDir::new(root).follow_links(false).min_depth(1) {
-        let entry = entry.with_context(|| format!("walking {}", root.display()))?;
-        let relative = entry.path().strip_prefix(root)?;
-        ensure!(
-            known.contains(relative),
-            "untracked file or directory in toy dataset: {}",
-            entry.path().display()
-        );
-        ensure!(
-            entry.file_type().is_dir() || entry.file_type().is_file(),
-            "unsafe dataset file type: {}",
-            entry.path().display()
-        );
     }
     for (index, (relative, is_dir)) in entries.into_iter().enumerate() {
         let target = root.join(&relative);
@@ -277,7 +278,7 @@ fn extract_verified(root: &Path, archive_path: &Path) -> Result<()> {
             let mut existing = BufReader::new(File::open(&target)?);
             ensure!(
                 streams_equal(&mut entry, &mut existing)?,
-                "extracted toy file differs from verified ZIP; refusing to overwrite: {}",
+                "extracted file differs from verified ZIP; refusing to overwrite: {}",
                 target.display()
             );
         } else {
@@ -357,22 +358,22 @@ fn md5_file(path: &Path) -> Result<String> {
 }
 
 fn decompress_checked(root: &Path, compressed: &Path, target: &Path) -> Result<()> {
-    ensure_directory(root, target.parent().context("LOTUS destination has no parent")?)?;
+    ensure_directory(root, target.parent().context("reference destination has no parent")?)?;
     let mut decoded = GzDecoder::new(BufReader::new(File::open(compressed)?));
     if regular_file(target)? {
         let mut existing = BufReader::new(File::open(target)?);
         ensure!(
             streams_equal(&mut decoded, &mut existing)?,
-            "existing LOTUS CSV differs from verified gzip; refusing to replace {}",
+            "existing reference differs from verified gzip; refusing to replace {}",
             target.display()
         );
     } else {
         let mut temporary = NamedTempFile::new_in(target.parent().unwrap())?;
         io::copy(&mut decoded, &mut temporary)
-            .with_context(|| format!("decompressing LOTUS CSV from {}", compressed.display()))?;
+            .with_context(|| format!("decompressing reference from {}", compressed.display()))?;
         temporary.as_file_mut().sync_all()?;
         temporary.persist_noclobber(target).with_context(|| {
-            format!("publishing LOTUS CSV without replacing {}", target.display())
+            format!("publishing reference without replacing {}", target.display())
         })?;
     }
     Ok(())

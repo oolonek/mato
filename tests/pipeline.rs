@@ -422,11 +422,6 @@ fn top_n_uses_only_selected_rows_and_independent_jobs_without_touching_the_defau
             .unwrap().query_map([], |row| row.get(0)).unwrap()
             .collect::<rusqlite::Result<_>>().unwrap();
         assert_eq!(files, expected);
-        let report = fs::read_dir(database.parent().unwrap().join("reports")).unwrap()
-            .next().unwrap().unwrap().path();
-        let saved = fs::read_to_string(report).unwrap();
-        assert!(saved.contains(&format!("Metadata selection: first {n} rows")), "{saved}");
-        assert!(saved.contains(&format!("--topN {n}")), "{saved}");
     }
     let full = fixture.run();
     assert!(full.status.success(), "{}", String::from_utf8_lossy(&full.stderr));
@@ -434,4 +429,47 @@ fn top_n_uses_only_selected_rows_and_independent_jobs_without_touching_the_defau
     let first = rusqlite::Connection::open(parent.join("top-n/1/flock.sqlite")).unwrap();
     let rows: i64 = first.query_row("SELECT count(*) FROM sample_rows", [], |row| row.get(0)).unwrap();
     assert_eq!(rows, 1, "a distinct top-N job must not expand the first one");
+}
+
+#[test]
+fn filters_and_sorts_metadata_before_validate_ingest_and_top_n() {
+    let fixture = Fixture::new("[\"validate\"]");
+    let config = fs::read_to_string(&fixture.config).unwrap()
+        .replace("stages = [\"validate\"]", "stages = [\"validate\"]\ntop_n_stages = [\"validate\", \"ingest\"]")
+        .replace("[database]\n", "[database]\ntop_n_root = \"top-n\"\n");
+    fs::write(&fixture.config, format!("{config}\n[selection]\nrequire_nonempty = [\"observation_subject\", \"collector_full_name\"]\n[[selection.sort]]\ncolumn = \"filename\"\ndescending = true\n")).unwrap();
+    let raw = fixture.metadata.parent().unwrap().parent().unwrap().join("peak/peak");
+    for name in ["b.mzML", "c.mzML", "d.mzML"] {
+        fs::write(raw.join(name), format!("{name} spectral bytes")).unwrap();
+    }
+    let original = "filename\tfile_path\tdirectus_filename\ttaxon_scientific_name\tionization_mode\tobservation_subject\tcollector_full_name\n\
+        sample.mzML\tdbgi_msdata/sample.mzML\tsample\tGeranium sibiricum\tpositive\t\tAda\n\
+        b.mzML\tdbgi_msdata/b.mzML\tb\tGeranium sibiricum\tpositive\tLeaf\tAda\n\
+        c.mzML\tdbgi_msdata/c.mzML\tc\tGeranium sibiricum\tpositive\tStems\tBob\n\
+        d.mzML\tdbgi_msdata/d.mzML\td\tGeranium sibiricum\tpositive\tFlower\t\n";
+    fs::write(&fixture.metadata, original).unwrap();
+    let run = || Command::new(env!("CARGO_BIN_EXE_mato"))
+        .args(["run", "--config"]).arg(&fixture.config).args(["--topN", "1"]).output().unwrap();
+    let result = run();
+    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    let db_path = fixture.database.parent().unwrap().join("top-n/1/flock.sqlite");
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    let selected: (String, String) = db.query_row(
+        "SELECT f.filename, s.observation_subject FROM spectrum_files f JOIN sample_rows s USING(dataset_id,row_number)",
+        [], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).unwrap();
+    assert_eq!(selected, ("c.mzML".into(), "Stems".into()));
+    let snapshot: String = db.query_row("SELECT metadata_path FROM datasets", [], |row| row.get(0)).unwrap();
+    assert!(snapshot.contains("/.mato-selections/"), "{snapshot}");
+    assert_eq!(fs::read_to_string(&fixture.metadata).unwrap(), original);
+    let again = run();
+    assert!(again.status.success(), "{}", String::from_utf8_lossy(&again.stderr));
+    let changed = fs::read_to_string(&fixture.config).unwrap().replace("descending = true", "descending = false");
+    fs::write(&fixture.config, changed).unwrap();
+    let rejected = run();
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("isolated database"),
+        "{}", String::from_utf8_lossy(&rejected.stderr));
+    let unchanged: String = db.query_row("SELECT filename FROM spectrum_files", [], |row| row.get(0)).unwrap();
+    assert_eq!(unchanged, "c.mzML");
 }

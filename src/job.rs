@@ -6,6 +6,7 @@ use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OpenFlags};
 
 use crate::config::Config;
+use crate::qlever;
 
 fn database_exists(path: &Path) -> Result<bool> {
     match fs::metadata(path) {
@@ -33,7 +34,11 @@ fn table_exists(db: &Connection, name: &str) -> Result<bool> {
 pub(crate) fn inspect(config: &Config) -> Result<()> {
     println!("config: {}", config.path.display());
     if let Some(n) = config.top_n {
-        println!("selection: first {n} metadata rows (isolated top-N job)");
+        let mode = if config.selection.is_some() { "filtered and sorted" } else { "source-order" };
+        println!("selection: up to {n} {mode} metadata rows (isolated top-N job)");
+        if let Some(source) = &config.source_metadata {
+            println!("source metadata: {}", source.display());
+        }
     }
     println!("dataset: {}", config.dataset_root.display());
     println!("DOI: {}", config.doi);
@@ -98,6 +103,8 @@ pub(crate) fn inspect(config: &Config) -> Result<()> {
             "missing"
         }
     );
+    println!("KG output: {} ({})", config.graph_dir.display(),
+        if config.graph_dir.is_dir() { "present" } else { "missing" });
     println!("Wikidata taxon index: {} ({})", config.taxon_index.display(),
         if config.taxon_index.is_file() { "present" } else { "missing" });
     println!("Wikidata chemical index: {} ({})", config.chemical_index.display(),
@@ -130,7 +137,7 @@ fn remove_file_if_present(path: &Path) -> Result<()> {
     }
 }
 
-fn resolved_path(path: &Path) -> Result<PathBuf> {
+pub(crate) fn resolved_path(path: &Path) -> Result<PathBuf> {
     match path.canonicalize() {
         Ok(resolved) => Ok(resolved),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -144,7 +151,7 @@ fn resolved_path(path: &Path) -> Result<PathBuf> {
     }
 }
 
-pub(crate) fn reset(config: &Config) -> Result<()> {
+pub(crate) fn reset(config: &Config, kg: bool) -> Result<()> {
     let db = &config.db;
     let output = &config.output_dir;
     let resolved_db = resolved_path(db)?;
@@ -187,6 +194,10 @@ pub(crate) fn reset(config: &Config) -> Result<()> {
         connection
             .execute_batch("PRAGMA busy_timeout=0; BEGIN EXCLUSIVE; ROLLBACK;")
             .with_context(|| format!("database is in use: {}", db.display()))?;
+    }
+    if kg {
+        // Validate QLever ownership before removing any database or Picoto outputs.
+        qlever::reset_graph(config)?;
     }
     println!("Deleting database: {}", db.display());
     println!("Deleting Picoto output: {}", output.display());

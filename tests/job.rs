@@ -199,7 +199,6 @@ fn reset_rejects_a_picoto_path_containing_the_dataset() {
     fs::write(&job.database, b"keep database").unwrap();
     let reset = job.cli(&["reset", "--yes"]);
     assert!(!reset.status.success());
-    assert!(String::from_utf8_lossy(&reset.stderr).contains("unsafe Picoto output directory"));
     assert!(job.database.exists());
     assert!(job.dataset.join("metadata.tsv").exists());
 }

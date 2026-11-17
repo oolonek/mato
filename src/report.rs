@@ -248,7 +248,7 @@ fn collect(config: &Config, start: &Start) -> Result<Data> {
     Ok(Data { metrics, failures })
 }
 
-fn quote_shell(value: &Path) -> String {
+pub(crate) fn quote_shell(value: &Path) -> String {
     let mut result = String::from("'");
     for ch in value.to_string_lossy().chars() {
         if ch == '\'' {
@@ -288,6 +288,8 @@ pub(crate) fn write(
     start: &Start,
     status: &str,
     error: Option<&anyhow::Error>,
+    graph: Option<&Path>,
+    validated: bool,
 ) -> Result<PathBuf> {
     let report_dir = config
         .db
@@ -330,6 +332,26 @@ pub(crate) fn write(
         writeln!(files, "- {name}: {}", cell(&path.display().to_string()))
             .expect("writing to String");
     }
+    if let Some(graph) = graph {
+        let mut url = String::from("file://");
+        for byte in graph.to_string_lossy().bytes() {
+            if byte.is_ascii_alphanumeric() || b"/-._~".contains(&byte) {
+                url.push(char::from(byte));
+            } else {
+                write!(url, "%{byte:02X}").expect("writing to String");
+            }
+        }
+        writeln!(
+            files,
+            "- Knowledge graph: [N-Quads]({url}) ({})",
+            cell(&graph.display().to_string())
+        )
+        .expect("writing to String");
+    } else {
+        files.push_str("- Knowledge graph: Not produced.\n");
+    }
+    writeln!(files, "- SHACL validated: {}", if validated { "yes" } else { "no" })
+        .expect("writing to String");
     let manifest = config.flock_root.join("mato/Cargo.toml");
     let mut commands = String::new();
     for (table, limit) in [
@@ -359,8 +381,21 @@ pub(crate) fn write(
         }
         commands.push('\n');
     }
+    if let Some(graph) = graph {
+        let peregrino = config.flock_root.join("peregrino/Cargo.toml");
+        let coverage = config.flock_root.join("peregrino/kg/coverage.rq");
+        writeln!(
+            commands,
+            "cargo run --release --manifest-path {} -- kg query --graph {} --query {}",
+            quote_shell(&peregrino),
+            quote_shell(graph),
+            quote_shell(&coverage),
+        )
+        .expect("writing to String");
+    }
     let failure = match error {
         Some(error) => format!("> {}\n", cell(&format!("{error:#}"))),
+        None if status == "partial" => "> Annotation files require reprocessing; see failed files above.\n".to_owned(),
         None => "None.\n".to_owned(),
     };
     let doi = cell(&config.doi);
@@ -370,7 +405,11 @@ pub(crate) fn write(
         .as_secs()
         .to_string();
     let selection = top_n
-        .map(|value| format!("first {value} rows"))
+        .map(|value| if config.selection.is_some() {
+            format!("up to {value} filtered/sorted rows")
+        } else {
+            format!("first {value} source-order rows")
+        })
         .unwrap_or_else(|| "all rows".to_owned());
     let name_base = format!("run-{}-{}", start.started.as_millis(), std::process::id());
     for sequence in 0..100 {

@@ -3,7 +3,7 @@ workspace = "/path/to/workspace"
 flock_root = "../.."
 
 [pipeline]
-stages = ["validate", "ingest", "enrich", "picoto", "register", "annotate", "chemical_enrich"]
+stages = ["validate", "ingest", "enrich", "picoto", "register", "annotate", "chemical_enrich", "kg_export", "kg_validate"]
 
 [dataset]
 root = "sapayoa/zenodo-10018590"
@@ -11,6 +11,9 @@ doi = "10.5281/zenodo.10018264"
 metadata = "metadata/metadata.tsv"
 ms_dir = "msdata/raw"
 taxon_column = "source_taxon"
+
+[dataset.archive]
+doi = "10.5281/zenodo.10018590"
 
 [database]
 path = "mato/toy.sqlite"
@@ -24,9 +27,25 @@ library = "hocofaisan/references/isdb_lotus_pos_energySum.mgf"
 lotus_csv = "hocofaisan/references/230106_frozen_metadata.csv"
 settings = "../../hocofaisan/config/example.toml"
 
+[annotation.library_source]
+url = "https://zenodo.org/records/14887271/files/isdb_lotus_pos_energySum.mgf?download=1"
+md5 = "c025e3365ca913b46ec4f6637d381911"
+
+[annotation.lotus_source]
+url = "https://zenodo.org/records/7534071/files/230106_frozen_metadata.csv.gz?download=1"
+md5 = "324579ae4a4785bf1b50b532b0a00eec"
+compression = "gzip"
+
 [indexes]
 taxon_index = "mato/wikidata/taxa.sqlite"
 chemical_index = "mato/wikidata/chemicals.sqlite"
+create_missing = true
 
 [knowledge_graph]
 output_dir = "mato/toy-kg"
+
+[qlever]
+index_root = "mato/qlever-indexes"
+ui_data = "mato/qlever-ui"
+ui_image = "qleverui:latest"
+ui_port = 7044

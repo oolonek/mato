@@ -13,6 +13,8 @@ pub(crate) enum Stage {
     Register,
     Annotate,
     ChemicalEnrich,
+    KgExport,
+    KgValidate,
 }
 
 impl Stage {
@@ -25,6 +27,8 @@ impl Stage {
             Self::Register => "register",
             Self::Annotate => "annotate",
             Self::ChemicalEnrich => "chemical_enrich",
+            Self::KgExport => "kg_export",
+            Self::KgValidate => "kg_validate",
         }
     }
 
@@ -37,13 +41,15 @@ impl Stage {
             Self::Register => "registers Picoto results",
             Self::Annotate => "annotates positive-mode spectra with LOTUS taxonomy",
             Self::ChemicalEnrich => "resolves current library candidates by exact full InChIKey",
+            Self::KgExport => "exports the database as a linked N-Quads graph",
+            Self::KgValidate => "validates the exported graph against SHACL shapes",
         }
     }
 
     pub(crate) fn species(self) -> &'static str {
         match self {
             Self::Validate => "machaca",
-            Self::Ingest | Self::Register => "peregrino",
+            Self::Ingest | Self::Register | Self::KgExport | Self::KgValidate => "peregrino",
             Self::Enrich => "cunaguaro",
             Self::Picoto => "picoto",
             Self::Annotate => "hocofaisan",
@@ -54,7 +60,7 @@ impl Stage {
     pub(crate) fn emoji(self) -> &'static str {
         match self {
             Self::Validate => "🦗",
-            Self::Ingest | Self::Register | Self::Picoto => "🦈",
+            Self::Ingest | Self::Register | Self::Picoto | Self::KgExport | Self::KgValidate => "🦈",
             Self::Enrich => "🐆",
             Self::Annotate => "🦃",
             Self::ChemicalEnrich => "🐆",
@@ -78,6 +84,8 @@ struct Dataset {
     metadata: PathBuf,
     ms_dir: PathBuf,
     taxon_column: String,
+    #[serde(default)]
+    archive: Option<Archive>,
 }
 
 #[derive(Deserialize)]
@@ -104,6 +112,8 @@ struct Indexes {
     taxon_endpoint: Option<String>,
     #[serde(default)]
     chemical_endpoint: Option<String>,
+    #[serde(default)]
+    create_missing: bool,
 }
 
 
@@ -139,12 +149,93 @@ struct Annotation {
     library: PathBuf,
     lotus_csv: PathBuf,
     settings: PathBuf,
+    #[serde(default)]
+    library_source: Option<Source>,
+    #[serde(default)]
+    lotus_source: Option<Source>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct KnowledgeGraph {
     output_dir: PathBuf,
+    #[serde(default)]
+    allow_partial: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Archive {
+    doi: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Source {
+    url: String,
+    md5: String,
+    compression: Option<Compression>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Compression {
+    Gzip,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QleverFile {
+    index_root: Option<PathBuf>,
+    ui_data: Option<PathBuf>,
+    ui_image: Option<String>,
+    engine_image: Option<String>,
+    ui_port: Option<u16>,
+}
+
+pub(crate) struct QleverSettings {
+    pub(crate) index_root: PathBuf,
+    pub(crate) ui_data: PathBuf,
+    pub(crate) ui_image: String,
+    pub(crate) engine_image: String,
+    pub(crate) ui_port: u16,
+}
+
+impl QleverSettings {
+    pub(crate) fn load(path: &Path) -> Result<Self> {
+        let (_, dir, file) = load_file(path)?;
+        let workspace = existing_dir(&relative_to(&dir, &file.workspace), "workspace")?;
+        let source = existing_dir(&relative_to(&dir, &file.flock_root), "flock root")?;
+        let dataset = comparison_path(&relative_to(&workspace, &file.dataset.root))?;
+        let configured = file.qlever.unwrap_or_default();
+        let index_root = comparison_path(&relative_to(
+            &workspace,
+            configured.index_root.as_deref().unwrap_or(Path::new("mato/qlever-indexes")),
+        ))?;
+        let ui_data = comparison_path(&relative_to(
+            &workspace,
+            configured.ui_data.as_deref().unwrap_or(Path::new("mato/qlever-ui")),
+        ))?;
+        for path in [&index_root, &ui_data] {
+            ensure!(
+                path.starts_with(&workspace) && !path.starts_with(&dataset) && !path.starts_with(&source),
+                "QLever output must be inside workspace, outside dataset and source trees: {}",
+                path.display()
+            );
+        }
+        ensure!(
+            !index_root.starts_with(&ui_data) && !ui_data.starts_with(&index_root),
+            "QLever index and shared UI directories must be separate"
+        );
+        let ui_port = configured.ui_port.unwrap_or(7044);
+        ensure!(ui_port >= 1024, "QLever UI port must be at least 1024");
+        let ui_image = configured.ui_image.unwrap_or_else(|| "qleverui:latest".to_owned());
+        let engine_image = configured.engine_image.unwrap_or_else(|| {
+            "docker.io/adfreiburg/qlever@sha256:27d51763ca24bfe49a4f9e4108babae376f2dffef1313086b95bd262f06e6492".to_owned()
+        });
+        ensure!(!ui_image.trim().is_empty() && !engine_image.trim().is_empty(), "QLever image references cannot be empty");
+        Ok(Self { index_root, ui_data, ui_image, engine_image, ui_port })
+    }
 }
 
 #[derive(Deserialize)]
@@ -161,6 +252,10 @@ struct FileConfig {
     knowledge_graph: KnowledgeGraph,
     #[serde(default)]
     peregrino: Option<Peregrino>,
+    #[serde(default)]
+    qlever: Option<QleverFile>,
+    #[serde(default)]
+    selection: Option<crate::selection::Selection>,
 }
 
 pub(crate) struct Config {
@@ -171,6 +266,9 @@ pub(crate) struct Config {
     pub(crate) dataset_root: PathBuf,
     pub(crate) doi: String,
     pub(crate) metadata: PathBuf,
+    /// Original source metadata, when `metadata` is a selected immutable snapshot.
+    pub(crate) source_metadata: Option<PathBuf>,
+    pub(crate) selection: Option<crate::selection::Selection>,
     pub(crate) ms_dir: PathBuf,
     pub(crate) db: PathBuf,
     pub(crate) output_dir: PathBuf,
@@ -181,19 +279,11 @@ pub(crate) struct Config {
     pub(crate) lotus_csv: PathBuf,
     pub(crate) settings: PathBuf,
     pub(crate) chemical_index: PathBuf,
+    pub(crate) graph_dir: PathBuf,
+    pub(crate) allow_partial: bool,
+    pub(crate) create_missing_indexes: bool,
 }
 
-pub(crate) struct BootstrapPaths {
-    pub(crate) flock_root: PathBuf,
-    pub(crate) workspace_root: PathBuf,
-    pub(crate) dataset_root: PathBuf,
-    pub(crate) doi: String,
-    pub(crate) library: PathBuf,
-    pub(crate) lotus_csv: PathBuf,
-    pub(crate) taxon_index: PathBuf,
-    pub(crate) chemical_index: PathBuf,
-    pub(crate) graph_dir: PathBuf,
-}
 
 fn load_file(path: &Path) -> Result<(PathBuf, PathBuf, FileConfig)> {
     let path = existing_file(path, "job config")?;
@@ -203,72 +293,6 @@ fn load_file(path: &Path) -> Result<(PathBuf, PathBuf, FileConfig)> {
     Ok((path, dir, file))
 }
 
-pub(crate) fn bootstrap_paths(path: &Path) -> Result<BootstrapPaths> {
-    let (_, dir, file) = load_file(path)?;
-    let workspace_root = comparison_path(&relative_to(&dir, &file.workspace))?;
-    let flock_root = comparison_path(&relative_to(&dir, &file.flock_root))?;
-    let dataset_root = comparison_path(&relative_to(&workspace_root, &file.dataset.root))?;
-    let db = comparison_path(&relative_to(&workspace_root, &file.database.path))?;
-    let output_dir = comparison_path(&relative_to(&workspace_root, &file.picoto.output_dir))?;
-    let library = comparison_path(&relative_to(&workspace_root, &file.annotation.library))?;
-    let lotus_csv = comparison_path(&relative_to(&workspace_root, &file.annotation.lotus_csv))?;
-    let taxon_index = comparison_path(&relative_to(&workspace_root, &file.indexes.taxon_index))?;
-    let chemical_index = comparison_path(&relative_to(&workspace_root, &file.indexes.chemical_index))?;
-    let graph_dir = comparison_path(&relative_to(&workspace_root, &file.knowledge_graph.output_dir))?;
-    for (name, path) in [
-        ("dataset", &dataset_root),
-        ("database", &db),
-        ("Picoto output", &output_dir),
-        ("annotation library", &library),
-        ("LOTUS metadata", &lotus_csv),
-        ("taxon index", &taxon_index),
-        ("chemical index", &chemical_index),
-        ("knowledge graph output", &graph_dir),
-    ] {
-        ensure!(
-            !path.starts_with(&flock_root),
-            "{name} must be outside the flock source tree: {}",
-            path.display()
-        );
-    }
-    for (name, path) in [
-        ("database", &db),
-        ("Picoto output", &output_dir),
-        ("taxon index", &taxon_index),
-        ("chemical index", &chemical_index),
-        ("annotation library", &library),
-        ("LOTUS metadata", &lotus_csv),
-        ("knowledge graph output", &graph_dir),
-    ] {
-        ensure!(
-            !path.starts_with(&dataset_root),
-            "{name} must be outside the dataset source tree: {}",
-            path.display()
-        );
-    }
-    ensure!(
-        db != taxon_index && db != chemical_index && taxon_index != chemical_index,
-        "job database and shared indexes must have distinct paths"
-    );
-    ensure!(
-        !graph_dir.starts_with(&output_dir)
-            && !output_dir.starts_with(&graph_dir)
-            && !dataset_root.starts_with(&output_dir)
-            && !dataset_root.starts_with(&graph_dir),
-        "Picoto and KG outputs must be separate directories outside the dataset source tree"
-    );
-    Ok(BootstrapPaths {
-        flock_root,
-        workspace_root,
-        dataset_root,
-        doi: file.dataset.doi,
-        library,
-        lotus_csv,
-        taxon_index,
-        chemical_index,
-        graph_dir,
-    })
-}
 
 fn relative_to(base: &Path, path: &Path) -> PathBuf {
     if path.is_absolute() {
@@ -323,10 +347,14 @@ fn check_stages(stages: &[Stage], key: &str) -> Result<()> {
     for pair in stages.windows(2) {
         if pair[0] >= pair[1] {
             bail!(
-                "{key} must be unique and in this order: validate, ingest, enrich, picoto, register, annotate, chemical_enrich"
+                "{key} must be unique and in this order: validate, ingest, enrich, picoto, register, annotate, chemical_enrich, kg_export, kg_validate"
             );
         }
     }
+    ensure!(
+        !stages.contains(&Stage::KgValidate) || stages.contains(&Stage::KgExport),
+        "{key}: kg_validate requires kg_export earlier in the same job"
+    );
     Ok(())
 }
 
@@ -351,6 +379,76 @@ fn comparison_path(path: &Path) -> Result<PathBuf> {
         }
     }
     Ok(resolved)
+}
+
+/// Prepare only the inputs needed by the selected stages before checking their existence.
+pub(crate) fn prepare_inputs(path: &Path, top_n: Option<usize>) -> Result<()> {
+    let (_, dir, file) = load_file(path)?;
+    check_stages(&file.pipeline.stages, "pipeline.stages")?;
+    if let Some(top_n_stages) = &file.pipeline.top_n_stages {
+        check_stages(top_n_stages, "pipeline.top_n_stages")?;
+    }
+    if let Some(n) = top_n {
+        ensure!(n > 0 && file.database.top_n_root.is_some(), "--topN requires a positive limit and [database].top_n_root");
+    }
+    let stages = if top_n.is_some() {
+        file.pipeline.top_n_stages.as_deref().context("--topN requires top_n_stages")?
+    } else {
+        &file.pipeline.stages
+    };
+    let archive_needed = stages.iter().any(|stage| matches!(
+        stage,
+        Stage::Validate | Stage::Ingest | Stage::Picoto
+    ));
+    let refs_needed = stages.contains(&Stage::Annotate);
+    if (!archive_needed || file.dataset.archive.is_none())
+        && (!refs_needed || (file.annotation.library_source.is_none() && file.annotation.lotus_source.is_none()))
+    {
+        return Ok(());
+    }
+    let workspace = existing_dir(&relative_to(&dir, &file.workspace), "workspace root")?;
+    let dataset_root = comparison_path(&relative_to(&workspace, &file.dataset.root))?;
+    let metadata = comparison_path(&relative_to(&dataset_root, &file.dataset.metadata))?;
+    let ms_dir = comparison_path(&relative_to(&dataset_root, &file.dataset.ms_dir))?;
+    let library = comparison_path(&relative_to(&workspace, &file.annotation.library))?;
+    let lotus_csv = comparison_path(&relative_to(&workspace, &file.annotation.lotus_csv))?;
+    let flock_root = comparison_path(&relative_to(&dir, &file.flock_root))?;
+    ensure!(
+        dataset_root.starts_with(&workspace) && !dataset_root.starts_with(&flock_root),
+        "dataset root must be inside workspace and outside the source tree"
+    );
+    for input in [&metadata, &ms_dir] {
+        ensure!(input.starts_with(&dataset_root), "dataset input outside dataset root: {}", input.display());
+    }
+    for reference in [&library, &lotus_csv] {
+        ensure!(
+            reference.starts_with(&workspace) && !reference.starts_with(&dataset_root)
+                && !reference.starts_with(&flock_root),
+            "reference must be inside workspace, outside dataset and source trees: {}",
+            reference.display()
+        );
+    }
+    let archive = archive_needed.then_some(file.dataset.archive).flatten().map(|archive| {
+        crate::inputs::Archive { doi: archive.doi }
+    });
+    let download = |source: Source| crate::inputs::Download {
+        url: source.url,
+        md5: source.md5,
+        compression: source.compression.map(|compression| match compression {
+            Compression::Gzip => crate::inputs::Compression::Gzip,
+        }),
+    };
+    crate::inputs::prepare(&crate::inputs::InputSpec {
+        workspace_root: workspace,
+        dataset_root,
+        metadata,
+        ms_dir,
+        archive,
+        library,
+        lotus_csv,
+        library_source: refs_needed.then_some(file.annotation.library_source).flatten().map(download),
+        lotus_source: refs_needed.then_some(file.annotation.lotus_source).flatten().map(download),
+    })
 }
 
 impl Config {
@@ -384,7 +482,17 @@ impl Config {
 
         let flock_root = existing_dir(&relative_to(&dir, &file.flock_root), "flock root")?;
         let dataset_root = existing_dir(&relative_to(&workspace, &file.dataset.root), "dataset root")?;
-        let metadata = inside_dataset(&dataset_root, &file.dataset.metadata, false)?;
+        let source_metadata = inside_dataset(&dataset_root, &file.dataset.metadata, false)?;
+        let selected = if let (Some(selection), Some(limit)) = (file.selection.as_ref(), top_n) {
+            let snapshot = crate::selection::path(&dataset_root, &source_metadata, selection, limit)?;
+            let resolved = comparison_path(&snapshot)?;
+            ensure!(resolved.starts_with(&dataset_root) && resolved != source_metadata,
+                "selected metadata must stay within the dataset, separate from its source: {}", snapshot.display());
+            Some(resolved)
+        } else {
+            None
+        };
+        let metadata = selected.as_deref().unwrap_or(&source_metadata).to_path_buf();
         let ms_dir = inside_dataset(&dataset_root, &file.dataset.ms_dir, true)?;
         let (stages, db, output_dir) = if let Some(n) = top_n {
             let stages = file
@@ -432,6 +540,24 @@ impl Config {
                 relative_to(&workspace, &file.picoto.output_dir),
             )
         };
+        let graph_root = comparison_path(&relative_to(&workspace, &file.knowledge_graph.output_dir))?;
+        let graph_dir = if let Some(n) = top_n {
+            comparison_path(&graph_root.join(n.to_string()))?
+        } else {
+            graph_root.clone()
+        };
+        let db_safety = comparison_path(&db)?;
+        let picoto_safety = comparison_path(&output_dir)?;
+        ensure!(
+            graph_dir.starts_with(&workspace)
+                && !graph_dir.starts_with(&flock_root)
+                && !graph_dir.starts_with(&dataset_root)
+                && !graph_dir.starts_with(&picoto_safety)
+                && !picoto_safety.starts_with(&graph_dir)
+                && !db_safety.starts_with(&graph_dir)
+                && !graph_dir.starts_with(&db_safety),
+            "knowledge graph output must be separate from source, dataset, database and Picoto directories"
+        );
         let annotation = stages.contains(&Stage::Annotate);
         let library = relative_to(&workspace, &file.annotation.library);
         let lotus_csv = relative_to(&workspace, &file.annotation.lotus_csv);
@@ -453,6 +579,8 @@ impl Config {
             dataset_root,
             doi: file.dataset.doi,
             metadata,
+            source_metadata: selected.map(|_| source_metadata),
+            selection: top_n.and(file.selection),
             ms_dir,
             db,
             output_dir,
@@ -463,6 +591,9 @@ impl Config {
             lotus_csv,
             settings,
             chemical_index: relative_to(&workspace, &file.indexes.chemical_index),
+            graph_dir,
+            allow_partial: file.knowledge_graph.allow_partial,
+            create_missing_indexes: file.indexes.create_missing,
         })
     }
 }
